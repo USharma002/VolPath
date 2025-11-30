@@ -1,0 +1,3 @@
+VOLUME_EXTENT = 1.0
+
+__all__ = ["VOLUME_EXTENT"]
