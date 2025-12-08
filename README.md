@@ -1,17 +1,25 @@
 # VolPath
 
-This is a volume renderer with scalar field reconstruction.
-The omtivation for this came from the unstructured point clod data and how to resample it on a grid for Volume Rendering
+## Application Image
+<p align="center">
+  <img src="./icons/volpath.png" alt="VolPath GUI" width="100%">
+  <br>
+  <em>Neural Volume Rendering: TNG100-1 Subhalo 468590 Gas Density</em>
+</p>
 
-While many interpolators are there this repository provides the folloing ways:
-- Linear Interpolation
-- Nearest Neighbor
+## Overview
+
+VolPath is a volume renderer designed for scalar-field reconstruction.
+The motivation for this project came from working with unstructured point-cloud data and the need to resample it onto a grid for efficient volume rendering.
+
+This repository provides several interpolation and reconstruction methods:
+- Linear interpolation
+- Nearest neighbor
 - Gaussian RBF
-- Natural Neigbhor
-- Neural Representation (Training, Saving and Checkpoint in UI)
-- Octree
-- Point Cloud Visualization
+- Natural neighbor
+- Neural representation (with training, saving, and checkpointing through the UI)
+- Octree-based reconstruction
+- Point cloud visualization
 
-The code is meant to work with scientific data and currently supports ```hdf5``` and ```vtk``` file formats.
-The original idea was to make it work with the IllustrisTNG Dataset and have visualized a Subhalo from TNG100-1.
-
+The code is intended for scientific datasets and currently supports the hdf5 and vtk file formats.
+The original goal was to visualize data from the IllustrisTNG simulation, and the application has been used to render a subhalo from the TNG100-1 dataset.
