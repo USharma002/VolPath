@@ -39,29 +39,50 @@ def _evaluate_volume_with_network(
     else:
         mins = (0.0, 0.0, 0.0)
         maxs = (1.0, 1.0, 1.0)
-    x_lin = torch.linspace(float(mins[0]), float(maxs[0]), resolution, device=device, dtype=dtype)
-    y_lin = torch.linspace(float(mins[1]), float(maxs[1]), resolution, device=device, dtype=dtype)
-    z_lin = torch.linspace(float(mins[2]), float(maxs[2]), resolution, device=device, dtype=dtype)
+    # Create coordinate axes as CPU numpy arrays for low-memory, chunked evaluation
+    x_np = np.linspace(float(mins[0]), float(maxs[0]), resolution, dtype=np.float32)
+    y_np = np.linspace(float(mins[1]), float(maxs[1]), resolution, dtype=np.float32)
+    z_np = np.linspace(float(mins[2]), float(maxs[2]), resolution, dtype=np.float32)
+    # Torch-friendly tensors for non-chunked fast path
+    x_lin = torch.from_numpy(x_np).to(device=device, dtype=dtype)
+    y_lin = torch.from_numpy(y_np).to(device=device, dtype=dtype)
+    z_lin = torch.from_numpy(z_np).to(device=device, dtype=dtype)
     with torch.no_grad():
         if chunk_slices and resolution >= 128:
-            xy = torch.stack(torch.meshgrid(x_lin, y_lin, indexing='ij'), dim=-1)
-            xy = xy.reshape(-1, 2).to(device=device, dtype=dtype)
+            # Build full XY grid on CPU to avoid holding large tensors on device
+            xx, yy = np.meshgrid(x_np, y_np, indexing='ij')
+            xy = np.stack((xx.ravel(), yy.ravel()), axis=1).astype(np.float32)
             slice_points = xy.shape[0]
-            volume_cpu = torch.empty((resolution, resolution, resolution), dtype=torch.float32)
-            for k, z_val in enumerate(z_lin):
-                z_col = torch.full((slice_points, 1), float(z_val), device=device, dtype=dtype)
-                coords = torch.cat([xy, z_col], dim=1)
+            volume_cpu = np.empty((resolution, resolution, resolution), dtype=np.float32)
+
+            # Cap batch size for safety on low-memory GPUs
+            safe_batch = min(batch_size, 16384)
+
+            for k, z_val in enumerate(z_np):
                 slice_chunks = []
-                for start in range(0, slice_points, batch_size):
-                    end = min(start + batch_size, slice_points)
-                    chunk = coords[start:end]
-                    pred = network(chunk)
-                    slice_chunks.append(pred.float())
-                slice_values = torch.cat(slice_chunks, dim=0).view(resolution, resolution)
-                volume_cpu[:, :, k] = slice_values.cpu()
+                z_col_value = float(z_val)
+                # Process XY in small batches to keep GPU memory low
+                for start in range(0, slice_points, safe_batch):
+                    end = min(start + safe_batch, slice_points)
+                    coords_np = np.empty((end - start, 3), dtype=np.float32)
+                    coords_np[:, 0:2] = xy[start:end]
+                    coords_np[:, 2] = z_col_value
+
+                    coords_tensor = torch.from_numpy(coords_np).to(device=device, dtype=dtype)
+                    pred = network(coords_tensor)
+                    # Move predictions to CPU immediately as float32
+                    slice_chunks.append(pred.float().cpu().numpy())
+                    # free GPU memory used by this batch
+                    del coords_tensor, pred
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
+                # Concatenate all chunk predictions for this slice and reshape
+                slice_values = np.concatenate(slice_chunks, axis=0)
+                slice_values = slice_values.reshape((resolution, resolution))
+                volume_cpu[:, :, k] = slice_values
+
             volume = volume_cpu
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
         else:
             grid = torch.stack(torch.meshgrid(x_lin, y_lin, z_lin, indexing='ij'), dim=-1)
             flat = grid.view(-1, 3)
@@ -74,7 +95,20 @@ def _evaluate_volume_with_network(
             volume = torch.cat(outputs, dim=0)
             volume = volume.view(resolution, resolution, resolution)
     volume = volume * scalar_scale + scalar_min
-    return volume.detach().cpu().numpy().astype(np.float32, copy=False)
+    # Ensure result is on CPU numpy float32
+    if isinstance(volume, torch.Tensor):
+        result = volume.detach().cpu().numpy().astype(np.float32, copy=False)
+    else:
+        result = np.asarray(volume, dtype=np.float32)
+    # Final cleanup
+    if device.type == 'cuda':
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    import gc
+    gc.collect()
+    return result
 
 
 class NeuralFieldModel:
@@ -99,6 +133,81 @@ class NeuralFieldModel:
             self.batch_size,
             bounds,
             chunk_slices=self.chunked
+        )
+
+    def save_weights(self, filepath):
+        """Save model weights and metadata to a file."""
+        if not HAS_TORCH:
+            raise RuntimeError("PyTorch not available")
+        state = {
+            'network_state_dict': self.network.state_dict(),
+            'scalar_min': self.scalar_min,
+            'scalar_scale': self.scalar_scale,
+            'batch_size': self.batch_size,
+            'chunked': self.chunked
+        }
+        torch.save(state, filepath)
+
+    @classmethod
+    def load_weights(cls, filepath, low_memory=False):
+        """Load model weights from a file and reconstruct the model."""
+        if not HAS_TORCH or not HAS_TCNN:
+            raise RuntimeError("PyTorch and tinycudann required")
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        state = torch.load(filepath, map_location=device, weights_only=False)
+        
+        # Rebuild the network architecture
+        if low_memory:
+            encoding_config = {
+                "otype": "HashGrid",
+                "n_levels": 12,
+                "n_features_per_level": 2,
+                "log2_hashmap_size": 16,
+                "base_resolution": 8,
+                "per_level_scale": 1.5
+            }
+            network_config = {
+                "otype": "FullyFusedMLP",
+                "n_hidden_layers": 2,
+                "n_neurons": 32,
+                "activation": "ReLU",
+                "output_activation": "None"
+            }
+        else:
+            encoding_config = {
+                "otype": "HashGrid",
+                "n_levels": 16,
+                "n_features_per_level": 2,
+                "log2_hashmap_size": 18,
+                "base_resolution": 16,
+                "per_level_scale": 1.5
+            }
+            network_config = {
+                "otype": "FullyFusedMLP",
+                "n_hidden_layers": 2,
+                "n_neurons": 64,
+                "activation": "ReLU",
+                "output_activation": "None"
+            }
+        
+        network = tcnn.NetworkWithInputEncoding(
+            n_input_dims=3,
+            n_output_dims=1,
+            encoding_config=encoding_config,
+            network_config=network_config
+        ).to(device)
+        
+        network.load_state_dict(state['network_state_dict'])
+        network.eval()
+        
+        return cls(
+            network=network,
+            device=device,
+            scalar_min=state['scalar_min'],
+            scalar_scale=state['scalar_scale'],
+            batch_size=state['batch_size'],
+            chunked=state.get('chunked', False)
         )
 
 
@@ -254,35 +363,40 @@ class NeuralFieldTrainer(QThread):
         self.training_complete.emit(model_wrapper, completed)
 
     def _build_model(self):
+        # Check if custom architecture settings are provided
+        arch = self.config.get('architecture', {})
+        
         if self.low_memory:
+            # Low memory mode: suitable for GPUs with ≤6GB VRAM
             encoding_config = {
                 "otype": "HashGrid",
-                "n_levels": 12,
-                "n_features_per_level": 2,
-                "log2_hashmap_size": 16,
-                "base_resolution": 8,
-                "per_level_scale": 1.5
+                "n_levels": arch.get('n_levels', 12),
+                "n_features_per_level": arch.get('n_features_per_level', 2),
+                "log2_hashmap_size": min(arch.get('log2_hashmap_size', 16), 18),  # Cap at 18 for low memory
+                "base_resolution": arch.get('base_resolution', 8),
+                "per_level_scale": arch.get('per_level_scale', 1.5)
             }
             network_config = {
                 "otype": "FullyFusedMLP",
-                "n_hidden_layers": 2,
-                "n_neurons": 32,
+                "n_hidden_layers": min(arch.get('n_hidden_layers', 2), 3),  # Cap at 3 layers
+                "n_neurons": min(arch.get('n_neurons', 32), 64),  # Cap at 64 neurons
                 "activation": "ReLU",
                 "output_activation": "None"
             }
         else:
+            # Normal mode: use custom or original defaults
             encoding_config = {
                 "otype": "HashGrid",
-                "n_levels": 16,
-                "n_features_per_level": 2,
-                "log2_hashmap_size": 18,
-                "base_resolution": 16,
-                "per_level_scale": 1.5
+                "n_levels": arch.get('n_levels', 16),
+                "n_features_per_level": arch.get('n_features_per_level', 2),
+                "log2_hashmap_size": arch.get('log2_hashmap_size', 18),
+                "base_resolution": arch.get('base_resolution', 16),
+                "per_level_scale": arch.get('per_level_scale', 1.5)
             }
             network_config = {
                 "otype": "FullyFusedMLP",
-                "n_hidden_layers": 2,
-                "n_neurons": 64,
+                "n_hidden_layers": arch.get('n_hidden_layers', 2),
+                "n_neurons": arch.get('n_neurons', 64),
                 "activation": "ReLU",
                 "output_activation": "None"
             }

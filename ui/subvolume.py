@@ -2,25 +2,39 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Tuple
+import weakref
 
 import numpy as np
+import pyvista as pv
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
-from vispy import scene
 
 Bounds = Optional[Tuple[np.ndarray, np.ndarray]]
 
 
-@dataclass
 class SubvolumeController:
-    gui: "VolumeRenderingGUI"
-    volume_extent: float
+    """Controller for subvolume selection and extraction.
+    
+    Uses weakref to gui to avoid circular references.
+    Uses __slots__ to reduce memory overhead.
+    """
+    __slots__ = ('_gui_ref', 'volume_extent', '__weakref__')
+    
+    def __init__(self, gui: "VolumeRenderingGUI", volume_extent: float):
+        self._gui_ref = weakref.ref(gui)
+        self.volume_extent = volume_extent
+    
+    @property
+    def gui(self):
+        """Get gui from weakref."""
+        return self._gui_ref()
 
     def on_toggled(self, checked: bool) -> None:
         self._clamp_centers_for_size()
         state = "enabled" if checked else "disabled"
         gui = self.gui
+        if gui is None:
+            return
         gui.current_subvolume_bounds = None if not checked else self.get_active_bounds()
         if hasattr(gui, "log_text"):
             gui.log(f"Subvolume zoom {state}.")
@@ -28,7 +42,10 @@ class SubvolumeController:
         self.update_extract_button_state()
 
     def on_slider_changed(self, axis: str) -> None:
-        sliders = self.gui.subvolume_center_sliders
+        gui = self.gui
+        if gui is None:
+            return
+        sliders = gui.subvolume_center_sliders
         labels = self.gui.subvolume_center_labels
         if axis not in sliders:
             return
@@ -82,7 +99,7 @@ class SubvolumeController:
 
     def update_visual(self) -> None:
         gui = self.gui
-        if not gui.view or not gui.canvas:
+        if not gui.plotter:
             return
         bounds = self.get_active_bounds(require_enabled=False)
         if not bounds or not (gui.subvolume_group and gui.subvolume_group.isChecked()):
@@ -95,46 +112,49 @@ class SubvolumeController:
         span = np.maximum(max_corner - min_corner, 1e-4)
         max_corner = min_corner + span
 
-        corners = np.array([
-            [min_corner[0], min_corner[1], min_corner[2]],
-            [max_corner[0], min_corner[1], min_corner[2]],
-            [min_corner[0], max_corner[1], min_corner[2]],
-            [max_corner[0], max_corner[1], min_corner[2]],
-            [min_corner[0], min_corner[1], max_corner[2]],
-            [max_corner[0], min_corner[1], max_corner[2]],
-            [min_corner[0], max_corner[1], max_corner[2]],
-            [max_corner[0], max_corner[1], max_corner[2]],
-        ], dtype=np.float32)
-
-        edges = np.array([
-            [0, 1], [1, 3], [3, 2], [2, 0],
-            [4, 5], [5, 7], [7, 6], [6, 4],
-            [0, 4], [1, 5], [2, 6], [3, 7],
-        ], dtype=np.uint32)
-
-        if gui.subvolume_box_visual:
-            gui.subvolume_box_visual.parent = None
+        # Remove existing box visual
+        if gui.subvolume_box_visual is not None:
+            try:
+                gui.plotter.remove_actor(gui.subvolume_box_visual)
+            except Exception:
+                pass
             gui.subvolume_box_visual = None
 
-        line = scene.visuals.Line(
-            pos=corners,
-            connect=edges,
-            color=(1.0, 0.8, 0.2, 1.0),
-            width=2.0,
-            method='gl',
-            parent=gui.view.scene
-        )
-        line.set_gl_state(depth_test=True, blend=False)
-        gui.subvolume_box_visual = line
-        gui.canvas.update()
+        # Create a wireframe box using PyVista
+        box = pv.Box(bounds=[
+            min_corner[0], max_corner[0],
+            min_corner[1], max_corner[1],
+            min_corner[2], max_corner[2]
+        ])
+        edges = box.extract_all_edges()
+        
+        try:
+            gui.subvolume_box_visual = gui.plotter.add_mesh(
+                edges,
+                color=(1.0, 0.8, 0.2),
+                opacity=1.0,
+                line_width=2,
+                render_lines_as_tubes=False,
+                show_scalar_bar=False,
+            )
+            # Respect the show/hide checkbox state
+            show_box_check = getattr(gui, 'show_subvolume_box_check', None)
+            if show_box_check is not None and not show_box_check.isChecked():
+                gui.subvolume_box_visual.SetVisibility(False)
+            gui.plotter.render()
+        except Exception as e:
+            print(f"Subvolume box error: {e}")
 
     def remove_visual(self) -> None:
         gui = self.gui
-        if gui.subvolume_box_visual:
-            gui.subvolume_box_visual.parent = None
+        if gui.subvolume_box_visual is not None:
+            try:
+                gui.plotter.remove_actor(gui.subvolume_box_visual)
+            except Exception:
+                pass
             gui.subvolume_box_visual = None
-            if gui.canvas:
-                gui.canvas.update()
+            if gui.plotter:
+                gui.plotter.render()
 
     def get_active_bounds(self, require_enabled: bool = True) -> Bounds:
         gui = self.gui

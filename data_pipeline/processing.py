@@ -12,6 +12,7 @@ class DataProcessor:
 
     @staticmethod
     def apply_transform(field_name, field_data, transform, polydata=None, header=None):
+        """Apply a transform to field data. Optimized for memory efficiency."""
         transform = transform or 'Linear'
 
         if transform == 'Linear':
@@ -19,23 +20,26 @@ class DataProcessor:
         if transform == 'Log':
             return DataProcessor._log_shifted(field_data)
         if transform == 'Magnitude':
-            return np.linalg.norm(field_data, axis=1)
+            return np.linalg.norm(field_data, axis=1).astype(np.float32)
         if transform == 'Log Magnitude':
-            mag = np.linalg.norm(field_data, axis=1)
+            mag = np.linalg.norm(field_data, axis=1).astype(np.float32)
             return np.log10(mag + 1e-10)
         if transform == 'X Component':
-            return field_data[:, 0]
+            return np.ascontiguousarray(field_data[:, 0], dtype=np.float32)
         if transform == 'Y Component':
-            return field_data[:, 1]
+            return np.ascontiguousarray(field_data[:, 1], dtype=np.float32)
         if transform == 'Z Component':
-            return field_data[:, 2]
+            return np.ascontiguousarray(field_data[:, 2], dtype=np.float32)
         if transform == 'Normalized':
-            arr = np.asarray(field_data, dtype=np.float64)
-            min_val = np.min(arr)
-            max_val = np.max(arr)
+            arr = np.asarray(field_data, dtype=np.float32)
+            min_val = arr.min()
+            max_val = arr.max()
             if max_val <= min_val:
                 return np.zeros_like(arr)
-            return (arr - min_val) / (max_val - min_val)
+            # In-place normalization to avoid extra allocation
+            result = arr - min_val
+            result /= (max_val - min_val)
+            return result
         if transform == 'Log Density (Arepo)':
             return DataProcessor._arepo_log(field_data)
         if transform == 'Log InternalEnergy (Arepo)':
@@ -88,23 +92,32 @@ class DataProcessor:
 
     @staticmethod
     def _log_shifted(values):
-        arr = np.asarray(values, dtype=np.float64)
-        finite = arr[np.isfinite(arr)]
-        min_val = finite.min() if finite.size else 0.0
+        """Log transform with automatic shift for non-positive values."""
+        arr = np.asarray(values, dtype=np.float32)
+        # Find min of finite values efficiently
+        finite_mask = np.isfinite(arr)
+        if finite_mask.any():
+            min_val = arr[finite_mask].min()
+        else:
+            min_val = 0.0
+        
         shift = 1e-10
         if min_val <= 0:
-            shift += -min_val + 1e-10
-        return np.log10(arr + shift)
+            shift = -min_val + 1e-10
+        
+        # In-place add to avoid copy
+        result = arr + shift
+        return np.log10(result)
 
     @staticmethod
     def _arepo_log(values):
-        arr = np.asarray(values, dtype=np.float64)
-        arr = np.clip(arr, 1e-30, None)
+        arr = np.asarray(values, dtype=np.float32)
+        np.clip(arr, 1e-30, None, out=arr)  # In-place clip
         return np.log10(arr) + 10.0
 
     @staticmethod
     def _flatten_scalar(field):
-        arr = np.asarray(field, dtype=np.float64)
+        arr = np.asarray(field, dtype=np.float32)
         if arr.ndim == 1:
             return arr
         reshaped = arr.reshape(arr.shape[0], -1)

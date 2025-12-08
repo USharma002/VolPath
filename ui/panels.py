@@ -35,9 +35,17 @@ def build_control_panel(gui, volume_extent):
     layout.addWidget(_build_viz_mode_group(gui))
     layout.addWidget(_build_file_group(gui))
     layout.addWidget(_build_plenoxel_group(gui))
-    layout.addWidget(_build_interpolation_group(gui, volume_extent))
-    layout.addWidget(_build_volume_render_group(gui))
-    layout.addWidget(_build_neural_group(gui))
+    
+    # Store references for mode-dependent visibility
+    gui.interpolation_group = _build_interpolation_group(gui, volume_extent)
+    layout.addWidget(gui.interpolation_group)
+    
+    # Subvolume section - visible in all modes
+    layout.addWidget(_build_subvolume_group(gui))
+    
+    gui.neural_settings_group = _build_neural_group(gui)
+    layout.addWidget(gui.neural_settings_group)
+    
     layout.addWidget(_build_camera_group(gui))
     layout.addWidget(_build_log_group(gui))
     layout.addStretch()
@@ -48,6 +56,7 @@ def _build_viz_mode_group(gui):
     group = QGroupBox("0. Visualization Mode")
     layout = QVBoxLayout()
 
+    # First row: Volume and Scatter
     mode_layout = QHBoxLayout()
     gui.volume_mode_btn = QPushButton("Volume Rendering")
     gui.volume_mode_btn.setCheckable(True)
@@ -70,6 +79,20 @@ def _build_viz_mode_group(gui):
     gui.viz_info_label = QLabel("Mode: Volume Rendering (interpolated)")
     gui.viz_info_label.setStyleSheet("color: #0066cc; font-size: 9px;")
     layout.addWidget(gui.viz_info_label)
+
+    # Display options
+    display_row = QHBoxLayout()
+    gui.show_bounding_box_check = QCheckBox("Bounding Box")
+    gui.show_bounding_box_check.setChecked(True)
+    gui.show_bounding_box_check.toggled.connect(gui.on_bounding_box_toggled)
+    display_row.addWidget(gui.show_bounding_box_check)
+    
+    gui.show_subvolume_box_check = QCheckBox("Subvolume Box")
+    gui.show_subvolume_box_check.setChecked(True)
+    gui.show_subvolume_box_check.toggled.connect(gui.on_subvolume_box_toggled)
+    display_row.addWidget(gui.show_subvolume_box_check)
+    display_row.addStretch()
+    layout.addLayout(display_row)
 
     group.setLayout(layout)
     return group
@@ -106,6 +129,7 @@ def _build_file_group(gui):
     type_layout.addWidget(QLabel("Particle Type:"))
     gui.particle_type_combo = QComboBox()
     gui.particle_type_combo.addItems(["PartType0", "PartType1", "PartType4", "PartType5"])
+    gui.particle_type_combo.currentTextChanged.connect(gui.on_particle_type_changed)
     type_layout.addWidget(gui.particle_type_combo)
     layout.addLayout(type_layout)
 
@@ -257,6 +281,20 @@ def _build_interpolation_group(gui, volume_extent):
     gui.resolution_warning.setVisible(False)
     layout.addWidget(gui.resolution_warning)
 
+    gui.progress_bar = QProgressBar()
+    layout.addWidget(gui.progress_bar)
+
+    gui.compute_btn = QPushButton("Compute Volume")
+    gui.compute_btn.clicked.connect(gui.compute_volume)
+    gui.compute_btn.setEnabled(False)
+    layout.addWidget(gui.compute_btn)
+
+    group.setLayout(layout)
+    return group
+
+
+def _build_subvolume_group(gui):
+    """Build the subvolume selection group - visible in all visualization modes."""
     gui.subvolume_group = QGroupBox("Subvolume Zoom")
     gui.subvolume_group.setCheckable(True)
     gui.subvolume_group.setChecked(False)
@@ -302,84 +340,7 @@ def _build_interpolation_group(gui, volume_extent):
     sub_layout.addWidget(gui.extract_subbox_btn)
 
     gui.subvolume_group.setLayout(sub_layout)
-    layout.addWidget(gui.subvolume_group)
-
-    gui.progress_bar = QProgressBar()
-    layout.addWidget(gui.progress_bar)
-
-    gui.compute_btn = QPushButton("Compute Volume")
-    gui.compute_btn.clicked.connect(gui.compute_volume)
-    gui.compute_btn.setEnabled(False)
-    layout.addWidget(gui.compute_btn)
-
-    cmap_layout = QHBoxLayout()
-    cmap_layout.addWidget(QLabel("Colormap:"))
-    gui.cmap_combo = QComboBox()
-    gui.cmap_combo.addItems(['magma', 'viridis', 'plasma', 'inferno', 'grays', 'hot', 'cool'])
-    gui.cmap_combo.setCurrentText(gui.transfer_function.colormap)
-    gui.cmap_combo.currentTextChanged.connect(gui.visualization.update_colormap)
-    cmap_layout.addWidget(gui.cmap_combo)
-    layout.addLayout(cmap_layout)
-
-    group.setLayout(layout)
-    return group
-
-
-def _build_volume_render_group(gui):
-    group = QGroupBox("2b. Volume Rendering Controls")
-    layout = QVBoxLayout()
-
-    method_row = QHBoxLayout()
-    method_row.addWidget(QLabel("Raymarch Method:"))
-    gui.volume_method_combo = QComboBox()
-    gui.volume_method_combo.addItems([
-        'mip',
-        'minip',
-        'average',
-        'translucent',
-        'additive',
-        'iso',
-    ])
-    gui.volume_method_combo.setCurrentText('mip')
-    gui.volume_method_combo.currentTextChanged.connect(gui.on_volume_method_changed)
-    method_row.addWidget(gui.volume_method_combo)
-    layout.addLayout(method_row)
-
-    step_row = QHBoxLayout()
-    step_row.addWidget(QLabel("Relative Step Size:"))
-    gui.volume_step_spin = QDoubleSpinBox()
-    gui.volume_step_spin.setDecimals(2)
-    gui.volume_step_spin.setRange(0.05, 5.0)
-    gui.volume_step_spin.setSingleStep(0.05)
-    gui.volume_step_spin.setValue(1.0)
-    gui.volume_step_spin.valueChanged.connect(gui.on_volume_step_changed)
-    step_row.addWidget(gui.volume_step_spin)
-    layout.addLayout(step_row)
-
-    threshold_row = QHBoxLayout()
-    threshold_row.addWidget(QLabel("Iso Threshold:"))
-    gui.volume_threshold_spin = QDoubleSpinBox()
-    gui.volume_threshold_spin.setDecimals(3)
-    gui.volume_threshold_spin.setRange(0.0, 1.0)
-    gui.volume_threshold_spin.setSingleStep(0.01)
-    gui.volume_threshold_spin.setValue(0.5)
-    gui.volume_threshold_spin.setEnabled(False)
-    gui.volume_threshold_spin.valueChanged.connect(gui.on_volume_threshold_changed)
-    threshold_row.addWidget(gui.volume_threshold_spin)
-    layout.addLayout(threshold_row)
-
-    note = QLabel("Step size controls ray-march sampling density. Threshold only affects 'iso'.")
-    note.setWordWrap(True)
-    note.setStyleSheet("color: #777; font-size: 9px;")
-    layout.addWidget(note)
-
-    group.setLayout(layout)
-
-    # Initialize renderer with default UI values
-    gui.on_volume_method_changed(gui.volume_method_combo.currentText())
-    gui.on_volume_step_changed(gui.volume_step_spin.value())
-    gui.on_volume_threshold_changed(gui.volume_threshold_spin.value())
-    return group
+    return gui.subvolume_group
 
 
 def _build_neural_group(gui):
@@ -399,23 +360,23 @@ def _build_neural_group(gui):
     gui.neural_params.clear()
 
     steps_spin = QSpinBox()
-    steps_spin.setRange(100, 500000)
-    steps_spin.setSingleStep(1000)
+    steps_spin.setRange(100, 1000000)
+    steps_spin.setSingleStep(5000)
     steps_spin.setValue(20000)
     gui.neural_params['steps'] = steps_spin
     form.addRow("Training Steps", steps_spin)
 
     batch_spin = QSpinBox()
-    batch_spin.setRange(512, 131072)
-    batch_spin.setSingleStep(512)
+    batch_spin.setRange(512, 262144)
+    batch_spin.setSingleStep(4096)
     batch_spin.setValue(16384)
     gui.neural_params['batch_size'] = batch_spin
     form.addRow("Batch Size", batch_spin)
 
     lr_spin = QDoubleSpinBox()
     lr_spin.setDecimals(5)
-    lr_spin.setRange(1e-5, 5e-2)
-    lr_spin.setSingleStep(5e-5)
+    lr_spin.setRange(1e-5, 1e-1)
+    lr_spin.setSingleStep(1e-4)
     lr_spin.setValue(1e-3)
     gui.neural_params['lr'] = lr_spin
     form.addRow("Learning Rate", lr_spin)
@@ -423,14 +384,14 @@ def _build_neural_group(gui):
     log_interval_spin = QSpinBox()
     log_interval_spin.setRange(1, 10000)
     log_interval_spin.setValue(100)
-    log_interval_spin.setSingleStep(25)
+    log_interval_spin.setSingleStep(50)
     gui.neural_params['log_interval'] = log_interval_spin
     form.addRow("Log Interval", log_interval_spin)
 
     preview_interval_spin = QSpinBox()
-    preview_interval_spin.setRange(0, 5000)
+    preview_interval_spin.setRange(0, 10000)
     preview_interval_spin.setValue(250)
-    preview_interval_spin.setSingleStep(25)
+    preview_interval_spin.setSingleStep(100)
     gui.neural_params['preview_interval'] = preview_interval_spin
     form.addRow("Preview Interval", preview_interval_spin)
 
@@ -442,20 +403,20 @@ def _build_neural_group(gui):
     form.addRow("Preview Resolution", preview_res_spin)
 
     inference_batch_spin = QSpinBox()
-    inference_batch_spin.setRange(1024, 131072)
+    inference_batch_spin.setRange(1024, 524288)
     inference_batch_spin.setValue(32768)
-    inference_batch_spin.setSingleStep(1024)
+    inference_batch_spin.setSingleStep(8192)
     gui.neural_params['inference_batch'] = inference_batch_spin
     form.addRow("Inference Batch", inference_batch_spin)
 
     gui.neural_render_res_spin = QSpinBox()
-    gui.neural_render_res_spin.setRange(64, 1024)
+    gui.neural_render_res_spin.setRange(64, 2048)
     gui.neural_render_res_spin.setValue(256)
     gui.neural_render_res_spin.setSingleStep(64)
     form.addRow("Render Resolution", gui.neural_render_res_spin)
 
     gui.neural_display_res_spin = QSpinBox()
-    gui.neural_display_res_spin.setRange(64, 1024)
+    gui.neural_display_res_spin.setRange(64, 2048)
     gui.neural_display_res_spin.setValue(256)
     gui.neural_display_res_spin.setSingleStep(64)
     form.addRow("Neural Mode Grid", gui.neural_display_res_spin)
@@ -500,6 +461,20 @@ def _build_neural_group(gui):
     render_layout.addWidget(gui.neural_render_btn)
     layout.addLayout(render_layout)
 
+    # Save/Load weights buttons
+    weights_layout = QHBoxLayout()
+    gui.neural_save_btn = QPushButton("💾 Save Weights")
+    gui.neural_save_btn.setEnabled(False)
+    gui.neural_save_btn.setToolTip("Save trained neural network weights to a file")
+    gui.neural_save_btn.clicked.connect(gui.save_neural_weights)
+    weights_layout.addWidget(gui.neural_save_btn)
+
+    gui.neural_load_btn = QPushButton("📂 Load Weights")
+    gui.neural_load_btn.setToolTip("Load pre-trained neural network weights from a file")
+    gui.neural_load_btn.clicked.connect(gui.load_neural_weights)
+    weights_layout.addWidget(gui.neural_load_btn)
+    layout.addLayout(weights_layout)
+
     gui.neural_loss_plot = LossPlotWidget()
     layout.addWidget(gui.neural_loss_plot)
 
@@ -522,7 +497,7 @@ def _build_camera_group(gui):
         ("Azimuth", 0, 360, 45),
         ("Elevation", -90, 90, 30),
         ("Roll", -180, 180, 0),
-        ("Distance", 50, 2000, 300),
+        ("Distance", 0.5, 100, 2.5),
         ("FOV", 0, 120, 60),
     ]
 

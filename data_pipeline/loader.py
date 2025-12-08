@@ -125,12 +125,26 @@ class DataLoader:
         for field_name, values_list in particle_data.items():
             try:
                 if field_name == "Coordinates":
-                    result[field_name] = np.vstack(values_list)
+                    # Use float32 for coordinates to save memory
+                    # Pre-compute total size for efficient allocation
+                    total_size = sum(v.shape[0] for v in values_list)
+                    coords = np.empty((total_size, 3), dtype=np.float32)
+                    offset = 0
+                    for v in values_list:
+                        n = v.shape[0]
+                        coords[offset:offset + n] = v
+                        offset += n
+                    result[field_name] = coords
                 else:
+                    # Concatenate and convert to float32
                     values = np.concatenate([
                         v.reshape(v.shape[0], -1) for v in values_list
                     ])
-                    result[field_name] = values
+                    # Only copy if dtype conversion needed
+                    if values.dtype != np.float32:
+                        result[field_name] = values.astype(np.float32, copy=False)
+                    else:
+                        result[field_name] = np.ascontiguousarray(values)
             except (ValueError, TypeError) as exc:
                 print(f"[DataLoader] Warning: Could not process '{field_name}': {exc}")
 

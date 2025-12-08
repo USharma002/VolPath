@@ -5,15 +5,75 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# =============================================================================
+# WSL / Linux compatibility - MUST be set before any VTK/Qt imports
+# =============================================================================
+def _setup_linux_rendering():
+    """Configure rendering backend for Linux/WSL compatibility."""
+    if sys.platform.startswith('linux'):
+        # Check if running under WSL
+        is_wsl = False
+        try:
+            with open('/proc/version', 'r') as f:
+                is_wsl = 'microsoft' in f.read().lower()
+        except Exception:
+            pass
+        
+        # Force software rendering if DISPLAY issues or WSL
+        if is_wsl or os.environ.get('LIBGL_ALWAYS_SOFTWARE') == '1':
+            os.environ['LIBGL_ALWAYS_SOFTWARE'] = '1'
+            os.environ['MESA_GL_VERSION_OVERRIDE'] = '3.3'
+            # Use EGL/OSMesa for offscreen if available
+            os.environ.setdefault('PYVISTA_OFF_SCREEN', 'false')
+        
+        # Ensure XDG_RUNTIME_DIR exists (required by Qt on some systems)
+        xdg_runtime = os.environ.get('XDG_RUNTIME_DIR')
+        if not xdg_runtime or not os.path.isdir(xdg_runtime):
+            fallback = f'/tmp/runtime-{os.getuid()}'
+            os.makedirs(fallback, mode=0o700, exist_ok=True)
+            os.environ['XDG_RUNTIME_DIR'] = fallback
+        
+        # Qt platform selection with fallback
+        # Try xcb first, but if libxcb-cursor0 is missing, fall back to offscreen
+        if 'QT_QPA_PLATFORM' not in os.environ:
+            # Check if libxcb-cursor is available
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ['ldconfig', '-p'], 
+                    capture_output=True, text=True, timeout=5
+                )
+                has_xcb_cursor = 'libxcb-cursor' in result.stdout
+            except Exception:
+                has_xcb_cursor = False
+            
+            if has_xcb_cursor:
+                os.environ['QT_QPA_PLATFORM'] = 'xcb'
+            else:
+                # Fallback: try xcb anyway, Qt may handle it
+                # User can override with QT_QPA_PLATFORM=offscreen if needed
+                os.environ['QT_QPA_PLATFORM'] = 'xcb'
+                print("Note: libxcb-cursor0 may be missing. If the app fails to start, run:")
+                print("  sudo apt install libxcb-cursor0")
+                print("Or set: export QT_QPA_PLATFORM=offscreen")
+        
+        # Disable Qt's GPU features that may conflict
+        os.environ.setdefault('QT_QUICK_BACKEND', 'software')
+
+_setup_linux_rendering()
+
+# Set Qt API for pyvistaqt before importing it
+os.environ["QT_API"] = "pyqt6"
+
 import numpy as np
-import OpenGL.GL as gl
+import pyvista as pv
+from pyvistaqt import QtInteractor
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QMessageBox, QDialog, QScrollArea, QPushButton
+    QFileDialog, QMessageBox, QDialog, QScrollArea, QPushButton, QFrame
 )
-from vispy import scene
-from vispy.app import use_app
+from PyQt6.QtGui import QIcon
 
 from config.optional import HAS_NATURAL_NEIGHBOR
 from data_pipeline.loader import DataLoader, load_multi_file_hdf5, load_vtk_polydata
@@ -28,7 +88,8 @@ from renderers.plenoxel import (
     plenoxel_volume_from_nodes,
 )
 from renderers.scatter import ScatterPlotRenderer
-from renderers.volume import VispyVolumeRenderer
+from renderers.volume import PyVistaVolumeRenderer
+from renderers.arepovtk import ArepoVTKRenderer
 from transfer.transfer_function import TransferFunction
 from ui.dialogs import BatchConfigDialog, MetadataDialog, ResolutionDialog
 from ui.panels import build_control_panel
@@ -41,7 +102,10 @@ if HAS_TORCH:
 else:  # pragma: no cover
     torch = None
 
-use_app('pyqt6')
+# Configure PyVista for Qt
+pv.set_plot_theme('dark')
+# Disable multisampling which interferes with volume rendering in QtInteractor
+pv.global_theme.multi_samples = 1
 
 VOLUME_EXTENT = 1.0
 
@@ -60,7 +124,8 @@ SNAPSHOT_FILE_FILTER = (
 class VolumeRenderingGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Volume Rendering - Interactive GUI")
+        self.setWindowTitle("Scalar Field Resampler - Volume Rendering")
+        self.setWindowIcon(QIcon("icons/app_icon.png"))
         self.resize(1600, 1000)
 
         # Data caches
@@ -128,46 +193,47 @@ class VolumeRenderingGUI(QMainWindow):
         self.plenoxel_build_btn = None
         self.plenoxel_stats_label = None
 
-        # Build vispy canvas and camera
-        self.canvas = scene.SceneCanvas(
-            keys='interactive',
-            bgcolor='#000000',
-            size=(1100, 900),
-            show=False
-        )
-        self.view = self.canvas.central_widget.add_view()
-        self.view.camera = scene.cameras.TurntableCamera(
-            fov=60,
-            azimuth=45,
-            elevation=30,
-            distance=2.5 * VOLUME_EXTENT,
-            center=(VOLUME_EXTENT / 2,) * 3
-        )
-        self.view.camera.depth_value = 50000
-        self.camera_controller = CameraController(self.view.camera, VOLUME_EXTENT)
-
-        # Renderer instances share the same view
-        self.volume_renderer = VispyVolumeRenderer(self.view, VOLUME_EXTENT, self.transfer_function)
-        self.neural_renderer = VispyVolumeRenderer(self.view, VOLUME_EXTENT, self.transfer_function)
-        self.scatter_renderer = ScatterPlotRenderer(self.view, VOLUME_EXTENT, self.transfer_function)
-        self.reference_cube = ReferenceCube(self.view, VOLUME_EXTENT)
-        self.reference_cube.render(visible=True)
-        self.plenoxel_renderer = PlenoxelRenderer(self.view, VOLUME_EXTENT)
-        self.plenoxel_nodes = None
-        self.plenoxel_stats = None
-        self.plenoxel_volume = None
-        self.plenoxel_visible = False
-
-        # Subvolume controller needs a view/canvas before wiring the UI
-        self.subvolume = SubvolumeController(self, VOLUME_EXTENT)
-        self.visualization = VisualizationController(self, VOLUME_EXTENT)
-
-        # Assemble Qt sidebars + canvas
+        # Assemble Qt sidebars + plotter
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(8)
+
+        # Build PyVista plotter embedded in Qt using a frame
+        self._plotter_frame = QFrame()
+        plotter_layout = QVBoxLayout(self._plotter_frame)
+        plotter_layout.setContentsMargins(0, 0, 0, 0)
+        self.plotter = QtInteractor(self._plotter_frame)
+        plotter_layout.addWidget(self.plotter.interactor)
+        self.plotter.set_background('black')
+        # Disable anti-aliasing - it interferes with volume rendering in QtInteractor
+        self.plotter.disable_anti_aliasing()
+        
+        # Store references for compatibility with old code patterns
+        self.canvas = self.plotter  # For backward compatibility
+        self.view = self.plotter   # For backward compatibility
+        
+        # Set up camera
+        self.camera_controller = CameraController(self.plotter, VOLUME_EXTENT)
+        self.camera_controller.reset()
+
+        # Renderer instances share the same plotter
+        self.volume_renderer = PyVistaVolumeRenderer(self.plotter, VOLUME_EXTENT, self.transfer_function)
+        self.neural_renderer = PyVistaVolumeRenderer(self.plotter, VOLUME_EXTENT, self.transfer_function)
+        self.scatter_renderer = ScatterPlotRenderer(self.plotter, VOLUME_EXTENT, self.transfer_function)
+        self.arepovtk_renderer = ArepoVTKRenderer(self.plotter, VOLUME_EXTENT, self.transfer_function)
+        self.reference_cube = ReferenceCube(self.plotter, VOLUME_EXTENT)
+        self.reference_cube.render(visible=True)
+        self.plenoxel_renderer = PlenoxelRenderer(self.plotter, VOLUME_EXTENT)
+        self.plenoxel_nodes = None
+        self.plenoxel_stats = None
+        self.plenoxel_volume = None
+        self.plenoxel_visible = False
+
+        # Subvolume controller needs a plotter before wiring the UI
+        self.subvolume = SubvolumeController(self, VOLUME_EXTENT)
+        self.visualization = VisualizationController(self, VOLUME_EXTENT)
 
         control_panel = build_control_panel(self, VOLUME_EXTENT)
         control_scroll = QScrollArea()
@@ -181,8 +247,9 @@ class VolumeRenderingGUI(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
 
-        self.canvas.native.setMinimumSize(640, 640)
-        right_layout.addWidget(self.canvas.native, 1)
+        # Add the PyVista plotter frame
+        self._plotter_frame.setMinimumSize(640, 640)
+        right_layout.addWidget(self._plotter_frame, 1)
 
         export_layout = QHBoxLayout()
         screenshot_btn = QPushButton("Save Screenshot…")
@@ -200,6 +267,17 @@ class VolumeRenderingGUI(QMainWindow):
         batch_btn = QPushButton("Batch Render…")
         batch_btn.clicked.connect(self.batch_render_dialog)
         export_layout.addWidget(batch_btn)
+        
+        # Visualization settings button
+        vol_settings_btn = QPushButton("Visualization Settings")
+        vol_settings_btn.clicked.connect(self.open_volume_render_settings)
+        export_layout.addWidget(vol_settings_btn)
+        
+        # Neural network settings button
+        neural_settings_btn = QPushButton("Neural Network Settings")
+        neural_settings_btn.clicked.connect(self.open_neural_network_settings)
+        export_layout.addWidget(neural_settings_btn)
+        
         export_layout.addStretch()
         right_layout.addLayout(export_layout)
 
@@ -221,20 +299,115 @@ class VolumeRenderingGUI(QMainWindow):
                 spinbox.blockSignals(False)
 
     def _connect_camera_events(self):
-        if not getattr(self, 'view', None) or not getattr(self.view, 'camera', None):
-            return
-        events = getattr(self.view.camera, 'events', None)
-        if events and hasattr(events, 'view_changed'):
-            events.view_changed.connect(self._on_camera_view_changed)
+        """Connect VTK camera observers for camera change events."""
+        try:
+            # Get the underlying VTK render window interactor
+            iren = self.plotter.iren
+            if iren is None:
+                return
+            
+            # Get the actual VTK interactor object
+            vtk_iren = iren.interactor if hasattr(iren, 'interactor') else iren
+            if vtk_iren is None:
+                return
+            
+            # Add observer for interaction events to sync camera controls
+            def on_interaction_end(obj, event):
+                if self._suppress_camera_event:
+                    return
+                if self.camera_controller:
+                    state = self.camera_controller.capture_state()
+                    self._sync_camera_controls(state)
+            
+            # Observe end of interaction to update spinboxes
+            vtk_iren.AddObserver('EndInteractionEvent', on_interaction_end)
+            
+            print("[Camera] Connected VTK camera observers")
+        except Exception as e:
+            print(f"[Camera] Failed to connect camera events: {e}")
+
+    def open_volume_render_settings(self):
+        """Open the visualization settings dialog."""
+        from ui.dialogs import VolumeRenderSettingsDialog
+        
+        # Get current settings from volume renderer
+        current_settings = {}
+        if self.volume_renderer:
+            current_settings = {
+                'method': getattr(self.volume_renderer, 'render_method', 'mip'),
+                'interpolation': getattr(self.volume_renderer, 'interpolation', 'trilinear'),
+                'step_size': getattr(self.volume_renderer, 'relative_step_size', 0.5),
+                'opacity_scale': getattr(self.volume_renderer, 'opacity_scale', 1.0),
+                'shade': getattr(self.volume_renderer, 'shade', False),
+            }
+        
+        # Get current scatter settings
+        if self.scatter_renderer:
+            current_settings['scatter'] = {
+                'point_size': getattr(self.scatter_renderer, 'point_size', 2),
+                'render_as_spheres': getattr(self.scatter_renderer, 'render_as_spheres', True),
+                'show_scalar_bar': getattr(self.scatter_renderer, 'show_scalar_bar', True),
+            }
+        
+        dialog = VolumeRenderSettingsDialog(self, current_settings)
+        dialog.show()
+
+    def open_neural_network_settings(self):
+        """Open the neural network settings dialog."""
+        from ui.dialogs import NeuralNetworkSettingsDialog
+        
+        # Get current settings from neural params and stored arch settings
+        current_settings = {}
+        
+        # Training params from panel
+        if hasattr(self, 'neural_params'):
+            params = self.neural_params
+            if 'steps' in params:
+                current_settings['steps'] = params['steps'].value()
+            if 'batch_size' in params:
+                current_settings['batch_size'] = params['batch_size'].value()
+            if 'lr' in params:
+                current_settings['lr'] = params['lr'].value()
+            if 'log_interval' in params:
+                current_settings['log_interval'] = params['log_interval'].value()
+            if 'preview_interval' in params:
+                current_settings['preview_interval'] = params['preview_interval'].value()
+            if 'preview_resolution' in params:
+                current_settings['preview_resolution'] = params['preview_resolution'].value()
+            if 'inference_batch' in params:
+                current_settings['inference_batch'] = params['inference_batch'].value()
+        
+        # Render/display resolution
+        if hasattr(self, 'neural_render_res_spin'):
+            current_settings['render_resolution'] = self.neural_render_res_spin.value()
+        if hasattr(self, 'neural_display_res_spin'):
+            current_settings['display_resolution'] = self.neural_display_res_spin.value()
+        
+        # Architecture settings (from stored settings or original defaults)
+        arch_defaults = {
+            'n_levels': 16,
+            'n_features_per_level': 2,
+            'log2_hashmap_size': 18,
+            'base_resolution': 16,
+            'per_level_scale': 1.5,
+            'n_hidden_layers': 2,
+            'n_neurons': 64,
+        }
+        arch_settings = getattr(self, '_neural_arch_settings', arch_defaults)
+        current_settings.update(arch_settings)
+        
+        dialog = NeuralNetworkSettingsDialog(self, current_settings)
+        dialog.show()
 
     def _detect_max_3d_texture_size(self):
+        # PyVista/VTK doesn't have this limitation as prominently
+        # Return a reasonable default
         try:
-            value = gl.glGetIntegerv(gl.GL_MAX_3D_TEXTURE_SIZE)
-            if isinstance(value, (tuple, list)):
-                value = value[0]
-            return int(value)
+            # Try to get OpenGL info through VTK
+            import vtk
+            return 2048  # Safe default for most GPUs
         except Exception:
-            return None
+            return 2048
 
     def _on_camera_view_changed(self, event):
         if self._suppress_camera_event:
@@ -246,15 +419,16 @@ class VolumeRenderingGUI(QMainWindow):
 
     def _on_transfer_function_live_update(self, *_):
         """Refresh active visuals when transfer function dialog changes"""
-        if self.volume_renderer and self.volume_renderer.visual is not None:
+        if self.volume_renderer and self.volume_renderer.actor is not None:
             self.volume_renderer.update_transfer_function(self.transfer_function)
-        if self.neural_renderer and self.neural_renderer.visual is not None:
+        if self.neural_renderer and self.neural_renderer.actor is not None:
             self.neural_renderer.update_transfer_function(self.transfer_function)
         if self.scatter_renderer:
             self.scatter_renderer.update_transfer_function(self.transfer_function)
-            if self.scatter_renderer.visual is not None:
+            # Update scatter plot in real-time (always recreate to apply new colormap)
+            if self.scatter_renderer.actor is not None:
                 self.visualization.create_scatter_plot(force_visible=(self.viz_mode == 'scatter'))
-        self.canvas.update()
+        self.plotter.render()
 
     def on_volume_method_changed(self, method: str):
         method = (method or '').strip()
@@ -270,14 +444,40 @@ class VolumeRenderingGUI(QMainWindow):
     def on_volume_step_changed(self, value: float):
         if self.volume_renderer:
             self.volume_renderer.update_render_settings(step_size=value)
-        if self.volume_renderer and self.volume_renderer.visual is not None:
-            self.canvas.update()
+        if self.volume_renderer and self.volume_renderer.actor is not None:
+            self.plotter.render()
 
     def on_volume_threshold_changed(self, value: float):
         if self.volume_renderer:
             self.volume_renderer.update_render_settings(threshold=value)
-        if self.volume_renderer and self.volume_renderer.visual is not None:
-            self.canvas.update()
+        if self.volume_renderer and self.volume_renderer.actor is not None:
+            self.plotter.render()
+
+    # --- Scatter plot settings handlers ----------------------------------------
+
+    def on_scatter_point_size_changed(self, value: int):
+        """Handle point size change for scatter plot."""
+        if self.scatter_renderer:
+            self.scatter_renderer.set_point_size(value)
+            if self.scatter_renderer.actor is not None:
+                # Re-render to apply new point size
+                self.visualization.create_scatter_plot(force_visible=(self.viz_mode == 'scatter'))
+
+    def on_scatter_spheres_toggled(self, enabled: bool):
+        """Handle render-as-spheres toggle for scatter plot."""
+        if self.scatter_renderer:
+            self.scatter_renderer.set_render_as_spheres(enabled)
+            if self.scatter_renderer.actor is not None:
+                # Re-render to apply sphere mode
+                self.visualization.create_scatter_plot(force_visible=(self.viz_mode == 'scatter'))
+
+    def on_scatter_scalar_bar_toggled(self, enabled: bool):
+        """Handle scalar bar visibility toggle for scatter plot."""
+        if self.scatter_renderer:
+            self.scatter_renderer.set_show_scalar_bar(enabled)
+            if self.scatter_renderer.actor is not None:
+                # Re-render to apply scalar bar setting
+                self.visualization.create_scatter_plot(force_visible=(self.viz_mode == 'scatter'))
 
     # --- Plenoxel helpers ------------------------------------------------------
 
@@ -331,6 +531,21 @@ class VolumeRenderingGUI(QMainWindow):
             self.rebuild_plenoxel_grid(auto=True)
         else:
             self.update_plenoxel_visual()
+
+    def on_bounding_box_toggled(self, checked: bool):
+        """Toggle visibility of the main bounding box (reference cube)."""
+        if self.reference_cube and self.reference_cube.actor:
+            self.reference_cube.actor.SetVisibility(checked)
+            self.plotter.render()
+
+    def on_subvolume_box_toggled(self, checked: bool):
+        """Toggle visibility of the subvolume selection box."""
+        if self.subvolume_box_visual is not None:
+            try:
+                self.subvolume_box_visual.SetVisibility(checked)
+                self.plotter.render()
+            except Exception:
+                pass
 
     def on_plenoxel_depth_changed(self):
         if self.plenoxel_min_depth_spin and self.plenoxel_max_depth_spin:
@@ -402,10 +617,10 @@ class VolumeRenderingGUI(QMainWindow):
             return
         if not self.plenoxel_visible or not self.plenoxel_nodes:
             self.plenoxel_renderer.clear()
-            self.canvas.update()
+            self.plotter.render()
             return
         self.plenoxel_renderer.render(self.plenoxel_nodes, self.plenoxel_stats, visible=True)
-        self.canvas.update()
+        self.plotter.render()
 
 
     def open_transfer_function_dialog(self):
@@ -422,13 +637,15 @@ class VolumeRenderingGUI(QMainWindow):
             data_min, data_max = 0.0, 1.0
 
         dialog.set_data_range(data_min, data_max)
+        
+        # Set histogram data for background visualization
+        dialog.opacity_editor.set_histogram(self.original_scalars)
+        
         dialog.transferFunctionChanged.connect(self._on_transfer_function_live_update)
 
         if dialog.exec():
             # Apply final changes and refresh
             self.transfer_function = dialog.tf
-            if self.cmap_combo:
-                self.cmap_combo.setCurrentText(self.transfer_function.colormap)
             self._on_transfer_function_live_update()
 
 
@@ -521,6 +738,9 @@ class VolumeRenderingGUI(QMainWindow):
                 self.nn_grid_values is not None
             )
             self.neural_reset_btn.setEnabled(reset_ready)
+        # Enable save button only when a trained model exists
+        if hasattr(self, 'neural_save_btn') and self.neural_save_btn:
+            self.neural_save_btn.setEnabled(self.neural_model is not None)
 
     def handle_neural_train_button(self):
         trainer = self.neural_trainer
@@ -543,6 +763,77 @@ class VolumeRenderingGUI(QMainWindow):
     def reset_neural_renderer(self):
         self._reset_neural_state()
         self.log("Neural renderer state reset")
+
+    def save_neural_weights(self):
+        """Save trained neural network weights to a file."""
+        if self.neural_model is None:
+            QMessageBox.warning(self, "No Model", "No trained neural model to save.")
+            return
+        
+        from PyQt6.QtWidgets import QFileDialog
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Neural Network Weights",
+            "",
+            "PyTorch Model (*.pt);;All Files (*)"
+        )
+        if not filepath:
+            return
+        
+        if not filepath.endswith('.pt'):
+            filepath += '.pt'
+        
+        try:
+            self.neural_model.save_weights(filepath)
+            self.log(f"Neural weights saved to: {filepath}")
+            if self.neural_status_label:
+                self.neural_status_label.setText("Status: weights saved ✓")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", f"Failed to save weights:\n{e}")
+            self.log(f"Failed to save neural weights: {e}")
+
+    def load_neural_weights(self):
+        """Load pre-trained neural network weights from a file."""
+        from PyQt6.QtWidgets import QFileDialog
+        from neural.trainer import NeuralFieldModel, HAS_TORCH, HAS_TCNN
+        
+        if not HAS_TORCH or not HAS_TCNN:
+            QMessageBox.warning(self, "Missing Dependencies", 
+                "PyTorch and tinycudann are required to load neural weights.")
+            return
+        
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Neural Network Weights",
+            "",
+            "PyTorch Model (*.pt);;All Files (*)"
+        )
+        if not filepath:
+            return
+        
+        try:
+            low_memory = bool(self.neural_low_memory_check and self.neural_low_memory_check.isChecked())
+            self.neural_model = NeuralFieldModel.load_weights(filepath, low_memory=low_memory)
+            self.log(f"Neural weights loaded from: {filepath}")
+            
+            if self.neural_status_label:
+                self.neural_status_label.setText("Status: weights loaded ✓")
+            
+            # Enable render and save buttons
+            self._update_neural_controls_state()
+            if self.neural_render_btn:
+                self.neural_render_btn.setEnabled(True)
+            if self.neural_save_btn:
+                self.neural_save_btn.setEnabled(True)
+            if self.neural_reset_btn:
+                self.neural_reset_btn.setEnabled(True)
+            
+            QMessageBox.information(self, "Weights Loaded", 
+                f"Neural network weights loaded successfully.\n\n"
+                f"Click 'Render Neural Volume' to generate the volume.")
+        except Exception as e:
+            QMessageBox.critical(self, "Load Failed", f"Failed to load weights:\n{e}")
+            self.log(f"Failed to load neural weights: {e}")
 
     def _reset_neural_state(self):
         if self.neural_trainer and self.neural_trainer.isRunning():
@@ -587,6 +878,11 @@ class VolumeRenderingGUI(QMainWindow):
             config['batch_size'] = min(config['batch_size'], 8192)
             config['preview_resolution'] = min(config['preview_resolution'], 96)
             config['inference_batch'] = min(config['inference_batch'], 16384)
+        
+        # Include custom architecture settings if set
+        if hasattr(self, '_neural_arch_settings') and self._neural_arch_settings:
+            config['architecture'] = self._neural_arch_settings
+        
         return config
 
     def _normalize_volume_for_render(self, volume):
@@ -673,13 +969,14 @@ class VolumeRenderingGUI(QMainWindow):
                 self.log("No neural volume available yet (train the model or compute a baseline volume)")
             return
         bounds = self.nn_bounds if self.nn_grid_values is not None else self.grid_bounds
-        grid_for_render = np.ascontiguousarray(np.transpose(grid, (2, 1, 0)))
+        # Don't transpose - keep same axis orientation as scatter plot
+        grid_for_render = np.ascontiguousarray(grid)
         self.neural_renderer.render(
             grid_for_render,
             visible=(self.viz_mode == 'neural'),
             bounds=bounds
         )
-        self.canvas.update()
+        self.plotter.render()
 
     def start_neural_training(self):
         if self.neural_trainer and self.neural_trainer.isRunning():
@@ -892,7 +1189,6 @@ class VolumeRenderingGUI(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Neural Renderer", f"Failed to render neural volume:\n{exc}")
 
-
     def log(self, message):
         """Add message to log"""
         timestamp = time.strftime('%H:%M:%S')
@@ -1086,12 +1382,17 @@ class VolumeRenderingGUI(QMainWindow):
         self.transform_combo.blockSignals(False)
 
     def _set_normalized_coords(self, coords):
-        self.coord_min = coords.min(axis=0)
-        self.coord_max = coords.max(axis=0)
+        # Use faster axis parameter for min/max
+        self.coord_min = np.min(coords, axis=0)
+        self.coord_max = np.max(coords, axis=0)
         span = self.coord_max - self.coord_min
         span[span == 0] = 1.0
         self.coord_span = span
-        self.data = ((coords - self.coord_min) / self.coord_span).astype(np.float32)
+        # In-place operations where possible
+        self.data = (coords - self.coord_min)
+        self.data /= self.coord_span
+        if self.data.dtype != np.float32:
+            self.data = self.data.astype(np.float32)
 
     def _refresh_metadata(self, polydata):
         """Cache header/dataset metadata for info dialog"""
@@ -1127,6 +1428,49 @@ class VolumeRenderingGUI(QMainWindow):
                 return arr2[:, 0]
             return np.linalg.norm(arr2, axis=1)
         return arr.ravel()
+
+    def on_particle_type_changed(self, ptype):
+        """Handle particle type change - reload data for the new particle type"""
+        if not self.snapshot_path:
+            return
+
+        # Only HDF5 files support particle types
+        suffix = Path(self.snapshot_path).suffix.lower()
+        if suffix not in HDF5_EXTENSIONS:
+            self.log(f"Particle type selection not supported for {suffix} files")
+            return
+
+        self.log(f"Switching to {ptype}...")
+
+        try:
+            # Reload the snapshot data and select new particle type
+            snapshot_data = DataLoader.load_snapshot(self.snapshot_path)
+            if not snapshot_data or ptype not in snapshot_data:
+                self.log(f"WARNING: {ptype} not found in snapshot")
+                QMessageBox.warning(self, "Warning", f"{ptype} not found in this snapshot")
+                return
+
+            poly = DataLoader.create_polydata(snapshot_data[ptype])
+            if poly is None or 'Coordinates' not in poly:
+                raise ValueError(f"Failed to create polydata for {ptype}")
+
+            # Re-ingest the new particle type data
+            self._refresh_metadata(poly)
+            total_particles = self._ingest_polydata(
+                poly,
+                source_label=f"HDF5 ({ptype})",
+                filename=self.snapshot_path
+            )
+            self.log(f"Loaded {total_particles:,} particles for {ptype}")
+
+            # If in scatter mode, immediately update the visualization
+            if self.viz_mode == 'scatter' and self.data is not None and self.scalars is not None:
+                self.visualization._update_scatter()
+
+        except Exception as exc:
+            self.log(f"ERROR switching particle type: {exc}")
+            import traceback
+            traceback.print_exc()
 
     def on_field_changed(self, field_name):
         """Handle scalar field selection"""
@@ -1185,8 +1529,9 @@ class VolumeRenderingGUI(QMainWindow):
         scalar_values = self._ensure_scalar_array(transformed)
         self._reset_neural_state()
         self._reset_plenoxel_state()
-        self.original_scalars = scalar_values.astype(np.float64, copy=True)
-        self.scalars = scalar_values.astype(np.float32, copy=True)
+        # Store as float32 to reduce memory usage
+        self.original_scalars = scalar_values.astype(np.float32, copy=True)
+        self.scalars = self.original_scalars.copy()  # Separate copy for modifications
         self._update_neural_controls_state()
         self._update_plenoxel_controls_state()
 
@@ -1196,15 +1541,15 @@ class VolumeRenderingGUI(QMainWindow):
         self.grid_values = None
         self.grid_bounds = None
 
-        scalar_min = float(np.min(self.original_scalars)) if self.original_scalars.size else 0.0
-        scalar_max = float(np.max(self.original_scalars)) if self.original_scalars.size else 0.0
+        scalar_min = float(self.original_scalars.min()) if self.original_scalars.size else 0.0
+        scalar_max = float(self.original_scalars.max()) if self.original_scalars.size else 0.0
         self.data_info_label.setText(
             f"Particles: {len(self.original_coords):,} | Range: [{scalar_min:.2e}, {scalar_max:.2e}]"
         )
         self.log(f"Field: {field_name}, Transform: {transform_name}")
         self.log(f"Scalar range: [{scalar_min:.3e}, {scalar_max:.3e}]")
 
-        refresh_scatter = update_scatter or (self.scatter_renderer and self.scatter_renderer.visual is not None)
+        refresh_scatter = update_scatter or (self.scatter_renderer and self.scatter_renderer.actor is not None)
         if refresh_scatter and self.original_coords is not None:
             self.visualization.create_scatter_plot()
 
@@ -1355,9 +1700,8 @@ class VolumeRenderingGUI(QMainWindow):
         params = {name: spinbox.value() for name, spinbox in self.cam_params.items()}
         self._suppress_camera_event = True
         self.camera_controller.update_from_params(params)
-        self.view.camera.view_changed()
         self._suppress_camera_event = False
-        self.canvas.update()
+        self.plotter.render()
 
     def set_camera_preset(self, azimuth, elevation):
         """Set camera to preset view"""
@@ -1401,8 +1745,7 @@ class VolumeRenderingGUI(QMainWindow):
             
             self.camera_controller.apply_config(config)
             self._sync_camera_controls(self.camera_controller.capture_state())
-            self.view.camera.view_changed()
-            self.canvas.update()
+            self.plotter.render()
             self.log(f"Camera config loaded")
             
         except Exception as e:
@@ -1410,7 +1753,7 @@ class VolumeRenderingGUI(QMainWindow):
 
     def save_screenshot(self):
         """Save current view as PNG"""
-        scatter_ready = self.scatter_renderer and self.scatter_renderer.visual is not None
+        scatter_ready = self.scatter_renderer and self.scatter_renderer.actor is not None
         if self.grid_values is None and not scatter_ready:
             QMessageBox.warning(self, "Warning", "No visualization to save")
             return
@@ -1422,9 +1765,8 @@ class VolumeRenderingGUI(QMainWindow):
         if not filename:
             return
         
-        native = getattr(self.canvas, 'native', None)
-        current_width = native.width() if native else 0
-        current_height = native.height() if native else 0
+        current_width = self.plotter.window_size[0]
+        current_height = self.plotter.window_size[1]
         resolution_dialog = ResolutionDialog(current_width, current_height, self)
         if resolution_dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1435,7 +1777,8 @@ class VolumeRenderingGUI(QMainWindow):
             img = self.visualization.render_image_for_export(
                 export_width,
                 export_height,
-                hide_reference_cube=True
+                hide_reference_cube=True,
+                hide_subvolume_box=True
             )
             from PIL import Image
             Image.fromarray(img).save(filename)
@@ -1503,6 +1846,12 @@ class VolumeRenderingGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please load data first")
             return
         
+        # Determine available modes
+        has_neural = (self.neural_model is not None or 
+                      (self.neural_trainer is not None and self.neural_trainer.model is not None))
+        has_plenoxel = (hasattr(self, 'plenoxel_nodes') and 
+                        self.plenoxel_nodes is not None)
+        
         # Create and show the dialog (non-modal so it stays open)
         self.batch_dialog = BatchConfigDialog(
             self,
@@ -1511,6 +1860,8 @@ class VolumeRenderingGUI(QMainWindow):
             current_epsilon=self.epsilon_spin.value(),
             allow_natural_neighbor=HAS_NATURAL_NEIGHBOR,
             batch_runner=self.run_batch_render_with_dialog,
+            has_neural_model=has_neural,
+            has_plenoxel=has_plenoxel,
         )
         
         # Show as non-modal
@@ -1518,7 +1869,11 @@ class VolumeRenderingGUI(QMainWindow):
         self.log("Batch render dialog opened - configure and click 'Start Batch Render'")
 
     def run_batch_render_with_dialog(self, configs, output_dir, pattern, canvas_size, dialog):
-        """Execute batch rendering with FIXED canvas size"""
+        """Execute batch rendering with FIXED canvas size for all render modes.
+        
+        Supports: volume, scatter, neural, plenoxel modes.
+        All renders use the same camera position for metric comparison.
+        """
         QApplication.processEvents()
         
         self.log(f"=== BATCH RENDER STARTED ===")
@@ -1531,15 +1886,16 @@ class VolumeRenderingGUI(QMainWindow):
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # SAVE ORIGINAL CANVAS SIZE
-        original_size = self.canvas.size
+        # SAVE ORIGINAL STATE
+        original_size = self.plotter.window_size
+        original_mode = self.viz_mode
         
-        # SET FIXED CANVAS SIZE FOR BATCH
-        self.canvas.native.resize(canvas_size[0], canvas_size[1])
+        # SET FIXED PLOTTER SIZE FOR BATCH
+        self.plotter.window_size = [canvas_size[0], canvas_size[1]]
         QApplication.processEvents()
-        self.log(f"Canvas resized to {canvas_size[0]}x{canvas_size[1]}")
+        self.log(f"Plotter resized to {canvas_size[0]}x{canvas_size[1]}")
         
-        # Save camera config from actual view.camera (captures interactive scatter view)
+        # Save camera config from plotter camera (for pixel-perfect reproduction)
         cam_config = self.camera_controller.to_config()
         cam_config['canvas_size'] = canvas_size
         cam_file = output_path / "camera_config.json"
@@ -1565,132 +1921,137 @@ class VolumeRenderingGUI(QMainWindow):
         
         # Process each configuration
         for idx, config in enumerate(configs):
+            mode = config.get('mode', 'volume')
+            method = config.get('method', 'linear')
+            resolution = config.get('resolution', 256)
+            label = config.get('label', '')
+            
             self.log(f"\n=== Processing config {idx+1}/{len(configs)} ===")
+            self.log(f"Mode: {mode}, Method: {method}, Resolution: {resolution}")
             
             # Update overall progress FIRST
-            config_name = f"{config['method']} @ {config['resolution']}³"
+            config_name = f"{mode}: {label or method} @ {resolution}³"
             dialog.update_overall_progress(idx, len(configs), config_name)
             
             # Update row status to "Running"
             dialog.update_row_status(
                 idx,
                 "▶ Running...",
-                progress=0,
+                progress=-1,  # Indeterminate
                 style="color: blue; font-size: 10px; font-weight: bold;"
             )
             
             QApplication.processEvents()
-            time.sleep(0.1)
             
-            self.log(f"Config: {config['method']} @ {config['resolution']}³, ε={config['epsilon']:.2f}")
+            # Apply colormap
+            self.transfer_function.set_colormap(config['colormap'])
+            QApplication.processEvents()
             
             # Format filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             epsilon_str = f"{config['epsilon']:.2f}".replace('.', 'p')
-            filename = pattern.format(
-                method=config['method'],
-                resolution=config['resolution'],
-                epsilon=epsilon_str,
-                colormap=config['colormap'],
-                index=idx,
-                timestamp=timestamp
-            )
+            max_depth = config.get('max_depth', 5)
+            min_points = config.get('min_points', 500)
+            try:
+                filename = pattern.format(
+                    mode=mode,
+                    method=method,
+                    resolution=resolution,
+                    epsilon=epsilon_str,
+                    max_depth=max_depth,
+                    min_points=min_points,
+                    colormap=config['colormap'],
+                    label=label or f"config{idx}",
+                    index=idx,
+                    timestamp=timestamp
+                )
+            except KeyError:
+                # Fallback if pattern has missing keys
+                filename = f"render_{mode}_{method}_{resolution}_{idx}"
             
-            # Update GUI controls to match config
-            self.method_combo.setCurrentText(config['method'])
-            self.resolution_spin.setValue(config['resolution'])
-            self.epsilon_spin.setValue(config['epsilon'])
-            self.cmap_combo.setCurrentText(config['colormap'])
-            QApplication.processEvents()
+            success = False
+            grid_to_save = None
+            stats_to_save = None
             
-            # Compute volume (synchronously for batch)
-            self.log(f"Computing volume...")
-            worker = self.interpolator_factory.create_worker(
-                self.data,
-                self.scalars,
-                config['resolution'],
-                config['method'],
-                config['epsilon']
-            )
-            
-            # Connect to capture results
-            result_holder = {'grid': None, 'stats': None, 'error': None}
-            
-            def capture_result(grid, elapsed, stats):
-                result_holder['grid'] = grid
-                result_holder['stats'] = stats
-            
-            def capture_error(msg):
-                result_holder['error'] = msg
-            
-            # Connect progress to dialog row
-            def update_row_progress(progress_value):
-                dialog.update_row_status(idx, "▶ Running...", progress=progress_value,
-                                        style="color: blue; font-size: 10px; font-weight: bold;")
-                QApplication.processEvents()
-            
-            worker.finished.connect(capture_result)
-            worker.error.connect(capture_error)
-            worker.progress.connect(update_row_progress)
-            worker.status.connect(self.log)
-            
-            # Run synchronously
-            self.log(f"Starting worker.run()...")
-            worker.run()
-            QApplication.processEvents()
-            
-            if result_holder['error']:
-                self.log(f"ERROR: {result_holder['error']}")
+            try:
+                if mode == 'volume':
+                    success, grid_to_save, stats_to_save = self._batch_render_volume(
+                        config, idx, dialog
+                    )
+                elif mode == 'scatter':
+                    success = self._batch_render_scatter(config, idx, dialog)
+                    grid_to_save = None  # Scatter doesn't have grid
+                elif mode == 'neural':
+                    success, grid_to_save = self._batch_render_neural(
+                        config, idx, dialog
+                    )
+                elif mode == 'plenoxel':
+                    success, grid_to_save = self._batch_render_plenoxel(config, idx, dialog)
+                elif mode == 'arepovtk':
+                    success, grid_to_save = self._batch_render_arepovtk(
+                        config, idx, dialog, canvas_size, cam_config
+                    )
+                else:
+                    self.log(f"Unknown mode: {mode}")
+                    dialog.update_row_status(
+                        idx, "✗ Unknown Mode", progress=None,
+                        style="color: red; font-size: 10px; font-weight: bold;"
+                    )
+                    continue
+                    
+            except Exception as e:
+                self.log(f"ERROR in {mode} render: {e}")
+                import traceback
+                traceback.print_exc()
                 dialog.update_row_status(
-                    idx,
-                    "✗ Failed",
-                    progress=None,
+                    idx, f"✗ Error: {str(e)[:20]}", progress=None,
                     style="color: red; font-size: 10px; font-weight: bold;"
                 )
                 QApplication.processEvents()
                 continue
             
-            if result_holder['grid'] is None:
-                self.log(f"ERROR: No result from worker")
+            if not success:
                 dialog.update_row_status(
-                    idx,
-                    "✗ No Data",
-                    progress=None,
+                    idx, "✗ Failed", progress=None,
                     style="color: red; font-size: 10px; font-weight: bold;"
                 )
                 QApplication.processEvents()
                 continue
             
-            # Update volume
-            self.grid_values = result_holder['grid']
-            self.current_stats = result_holder['stats']
-            self.visualization.update_volume_visual()
+            # Restore camera position before screenshot (ensures consistency)
+            self._restore_camera_from_config(cam_config)
             QApplication.processEvents()
-            
-            # ENSURE WE'RE IN VOLUME MODE FOR RENDERING
-            if self.viz_mode != 'volume':
-                self.visualization.set_mode('volume')
-                QApplication.processEvents()
             
             # Save outputs
             if config['save_png']:
                 png_file = output_path / f"{filename}.png"
                 try:
-                    img = self.visualization.render_image_for_export(
-                        canvas_size[0],
-                        canvas_size[1],
-                        hide_reference_cube=True
-                    )
+                    # ArepoVTK renders directly to image, use cached result
+                    if mode == 'arepovtk' and hasattr(self, '_arepovtk_rendered_image') and self._arepovtk_rendered_image is not None:
+                        img = self._arepovtk_rendered_image
+                        # Convert float [0,1] to uint8 [0,255]
+                        if img.dtype == np.float32 or img.dtype == np.float64:
+                            img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+                        self._arepovtk_rendered_image = None  # Clear cache
+                    else:
+                        img = self.visualization.render_image_for_export(
+                            canvas_size[0],
+                            canvas_size[1],
+                            hide_reference_cube=True,
+                            hide_subvolume_box=True
+                        )
                     from PIL import Image
                     Image.fromarray(img).save(png_file)
                     self.log(f"✓ Saved PNG: {png_file.name} ({canvas_size[0]}x{canvas_size[1]})")
                 except Exception as e:
                     self.log(f"✗ Failed to save PNG: {e}")
+                    import traceback
+                    traceback.print_exc()
             
-            if config['save_npy']:
+            if config['save_npy'] and grid_to_save is not None:
                 npy_file = output_path / f"{filename}.npy"
                 try:
-                    np.save(npy_file, self.grid_values)
+                    np.save(npy_file, grid_to_save)
                     self.log(f"✓ Saved NPY: {npy_file.name}")
                 except Exception as e:
                     self.log(f"✗ Failed to save NPY: {e}")
@@ -1699,10 +2060,11 @@ class VolumeRenderingGUI(QMainWindow):
             meta_file = output_path / f"{filename}_metadata.json"
             metadata = {
                 'config': config,
-                'stats': result_holder['stats'],
+                'stats': stats_to_save,
                 'filename': filename,
                 'canvas_size': canvas_size,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'camera': cam_config
             }
             with open(meta_file, 'w') as f:
                 json.dump(metadata, f, indent=2)
@@ -1718,10 +2080,11 @@ class VolumeRenderingGUI(QMainWindow):
             
             QApplication.processEvents()
         
-        # RESTORE ORIGINAL CANVAS SIZE
-        self.canvas.native.resize(original_size[0], original_size[1])
+        # RESTORE ORIGINAL STATE
+        self.plotter.window_size = [original_size[0], original_size[1]]
+        self.visualization.set_mode(original_mode)
         QApplication.processEvents()
-        self.log(f"Canvas restored to {original_size[0]}x{original_size[1]}")
+        self.log(f"Plotter restored to {original_size[0]}x{original_size[1]}")
         
         # Update final progress
         dialog.update_overall_progress(len(configs), len(configs), "")
@@ -1737,6 +2100,465 @@ class VolumeRenderingGUI(QMainWindow):
             f"Canvas size: {canvas_size[0]}x{canvas_size[1]}\n"
             f"Outputs saved to:\n{output_dir}"
         )
+
+    def _restore_camera_from_config(self, cam_config):
+        """Restore camera position from saved config for pixel-perfect consistency."""
+        try:
+            camera = self.plotter.camera
+            if 'position' in cam_config:
+                camera.position = cam_config['position']
+            if 'focal_point' in cam_config:
+                camera.focal_point = cam_config['focal_point']
+            elif 'center' in cam_config:
+                camera.focal_point = cam_config['center']
+            if 'up' in cam_config:
+                camera.up = cam_config['up']
+            if 'fov' in cam_config:
+                camera.view_angle = cam_config['fov']
+            self.plotter.render()
+        except Exception as e:
+            self.log(f"Warning: Could not restore camera: {e}")
+
+    def _batch_render_volume(self, config, idx, dialog):
+        """Render volume mode for batch processing."""
+        # Update GUI controls to match config
+        self.method_combo.setCurrentText(config['method'])
+        self.resolution_spin.setValue(config['resolution'])
+        self.epsilon_spin.setValue(config['epsilon'])
+        QApplication.processEvents()
+        
+        # Compute volume (synchronously for batch)
+        self.log(f"Computing volume: {config['method']} @ {config['resolution']}³")
+        worker = self.interpolator_factory.create_worker(
+            self.data,
+            self.scalars,
+            config['resolution'],
+            config['method'],
+            config['epsilon']
+        )
+        
+        # Connect to capture results
+        result_holder = {'grid': None, 'stats': None, 'error': None}
+        
+        def capture_result(grid, elapsed, stats):
+            result_holder['grid'] = grid
+            result_holder['stats'] = stats
+        
+        def capture_error(msg):
+            result_holder['error'] = msg
+        
+        # Connect progress to dialog row
+        def update_row_progress(progress_value):
+            dialog.update_row_status(idx, "▶ Computing...", progress=progress_value,
+                                    style="color: blue; font-size: 10px; font-weight: bold;")
+            QApplication.processEvents()
+        
+        worker.finished.connect(capture_result)
+        worker.error.connect(capture_error)
+        worker.progress.connect(update_row_progress)
+        worker.status.connect(self.log)
+        
+        # Run synchronously
+        worker.run()
+        QApplication.processEvents()
+        
+        if result_holder['error']:
+            self.log(f"ERROR: {result_holder['error']}")
+            return False, None, None
+        
+        if result_holder['grid'] is None:
+            self.log(f"ERROR: No result from worker")
+            return False, None, None
+        
+        # CRITICAL: Clear neural renderer completely before showing volume
+        if self.neural_renderer:
+            self.neural_renderer.clear()
+        if self.scatter_renderer:
+            self.scatter_renderer.clear()
+        if self.plenoxel_renderer:
+            self.plenoxel_renderer.clear()
+        QApplication.processEvents()
+        
+        # Update volume
+        self.grid_values = result_holder['grid']
+        self.current_stats = result_holder['stats']
+        self.visualization.update_volume_visual()
+        
+        # Make sure volume renderer is visible
+        if self.volume_renderer:
+            self.volume_renderer.set_active(True)
+        
+        # Update mode state
+        self.viz_mode = 'volume'
+        QApplication.processEvents()
+        
+        return True, result_holder['grid'], result_holder['stats']
+
+    def _batch_render_scatter(self, config, idx, dialog):
+        """Render scatter mode for batch processing."""
+        self.log(f"Rendering scatter plot")
+        dialog.update_row_status(idx, "▶ Scatter...", progress=-1,
+                                style="color: blue; font-size: 10px; font-weight: bold;")
+        QApplication.processEvents()
+        
+        # CRITICAL: Clear volume and neural renderers completely
+        if self.volume_renderer:
+            self.volume_renderer.clear()
+        if self.neural_renderer:
+            self.neural_renderer.clear()
+        if self.plenoxel_renderer:
+            self.plenoxel_renderer.clear()
+        QApplication.processEvents()
+        
+        # Create/update scatter plot and make visible
+        self.visualization.create_scatter_plot(force_visible=True)
+        if self.scatter_renderer:
+            self.scatter_renderer.set_active(True)
+        
+        # Update mode state
+        self.viz_mode = 'scatter'
+        QApplication.processEvents()
+        
+        return True
+
+    def _batch_render_neural(self, config, idx, dialog):
+        """Render neural mode for batch processing.
+        
+        Supports rendering from:
+        1. Cached trained model (after training completes)
+        2. Live trainer model (during training)
+        3. Currently displayed neural grid (fallback - saves current visualization)
+        """
+        resolution = config.get('resolution', 256)
+        self.log(f"Rendering neural volume @ {resolution}³")
+        dialog.update_row_status(idx, "▶ Neural inference...", progress=-1,
+                                style="color: blue; font-size: 10px; font-weight: bold;")
+        QApplication.processEvents()
+        
+        # Check if we have a neural model
+        trainer = self.neural_trainer
+        model = self.neural_model
+        
+        grid_values = None
+        
+        if model is not None:
+            # Use the cached trained model (after training completes)
+            try:
+                self.log(f"Using cached neural model for inference @ {resolution}³")
+                grid_values = model.generate_volume(resolution, bounds=self.current_subvolume_bounds)
+            except Exception as e:
+                self.log(f"Failed to generate from cached model: {e}")
+                import traceback
+                traceback.print_exc()
+                # Don't return yet - try fallbacks
+                
+        if grid_values is None and trainer is not None and trainer.model is not None:
+            # Use the live trainer model (during training)
+            try:
+                self.log(f"Using live trainer model for inference @ {resolution}³")
+                grid_values = trainer.evaluate_live_model(resolution, self.current_subvolume_bounds)
+            except Exception as e:
+                self.log(f"Failed to generate from trainer: {e}")
+                import traceback
+                traceback.print_exc()
+                # Don't return yet - try fallback
+        
+        # Fallback: use currently displayed neural grid if available
+        if grid_values is None and self.nn_grid_values is not None:
+            self.log(f"Using currently displayed neural grid (shape={self.nn_grid_values.shape})")
+            grid_values = self.nn_grid_values
+        
+        if grid_values is None:
+            self.log("No neural data available - train a model or switch to neural mode first")
+            return False, None
+        
+        self.log(f"Neural inference complete: shape={grid_values.shape}, range=[{grid_values.min():.4f}, {grid_values.max():.4f}]")
+        
+        # Store the neural grid values
+        self.nn_grid_values = grid_values
+        
+        # Compute bounds for neural grid - use normalized bounds (0-1)
+        # The render() method will apply VOLUME_EXTENT internally
+        if self.current_subvolume_bounds:
+            mins, maxs = self.current_subvolume_bounds
+            bounds = (mins, maxs)  # Keep normalized - render() applies extent
+        else:
+            bounds = None
+        self.nn_bounds = bounds
+        
+        # CRITICAL: Actually CLEAR the volume renderer (not just hide)
+        # This removes the actor entirely from the plotter
+        if self.volume_renderer:
+            self.volume_renderer.clear()
+            self.log("Cleared volume renderer")
+        
+        # Clear scatter renderer too
+        if self.scatter_renderer:
+            self.scatter_renderer.clear()
+        
+        # Clear plenoxel renderer
+        if self.plenoxel_renderer:
+            self.plenoxel_renderer.clear()
+        
+        QApplication.processEvents()
+        
+        # Now render the neural volume
+        dialog.update_row_status(idx, "▶ Rendering neural...", progress=50,
+                                style="color: blue; font-size: 10px; font-weight: bold;")
+        QApplication.processEvents()
+        
+        grid_for_render = np.ascontiguousarray(grid_values)
+        self.neural_renderer.render(
+            grid_for_render,
+            visible=True,
+            bounds=bounds
+        )
+        self.neural_renderer.set_active(True)
+        self.log(f"Neural renderer actor: {self.neural_renderer.actor is not None}")
+
+        # If the actor wasn't created, try a conservative re-render without bounds
+        if self.neural_renderer.actor is None:
+            self.log("Neural actor missing after first render — retrying with bounds=None")
+            try:
+                self.neural_renderer.render(grid_for_render, visible=True, bounds=None)
+                self.neural_renderer.set_active(True)
+                QApplication.processEvents()
+                self.plotter.render()
+            except Exception as e:
+                self.log(f"Exception during neural re-render: {e}")
+
+        # If still missing, abort and report failure so we don't save an empty screenshot
+        if self.neural_renderer.actor is None:
+            self.log("ERROR: Neural renderer produced no actor — aborting this render (no screenshot will be saved)")
+            return False, None
+        
+        # Update mode state
+        self.viz_mode = 'neural'
+        
+        # Update UI buttons
+        if hasattr(self, 'volume_mode_btn') and self.volume_mode_btn:
+            self.volume_mode_btn.blockSignals(True)
+            self.volume_mode_btn.setChecked(False)
+            self.volume_mode_btn.blockSignals(False)
+        if hasattr(self, 'scatter_mode_btn') and self.scatter_mode_btn:
+            self.scatter_mode_btn.blockSignals(True)
+            self.scatter_mode_btn.setChecked(False)
+            self.scatter_mode_btn.blockSignals(False)
+        if hasattr(self, 'neural_mode_btn') and self.neural_mode_btn:
+            self.neural_mode_btn.blockSignals(True)
+            self.neural_mode_btn.setChecked(True)
+            self.neural_mode_btn.blockSignals(False)
+        
+        self.plotter.render()
+        QApplication.processEvents()
+        
+        return True, grid_values
+
+    def _batch_render_arepovtk(self, config, idx, dialog, canvas_size, cam_config):
+        """Render using ArepoVTK-style CPU ray marcher.
+        
+        This bypasses the normal volume renderer and directly renders
+        to an image using CPU ray marching with IDW or Natural Neighbor interpolation.
+        
+        Config parameters:
+        - step_size: Step size as fraction of volume diagonal (default 0.01)
+        - idw_power: IDW power parameter (default 2.0, ArepoVTK standard)
+        - k_neighbors: Number of neighbors for KD-tree IDW (default 32)
+        - interpolation_method: 'idw' or 'natural_neighbor' (Sibson, matches Illustris TNG)
+        - nn_grid_resolution: Grid resolution for Natural Neighbor mode (default 128)
+        """
+        self.log(f"Starting ArepoVTK CPU ray marcher...")
+        dialog.update_row_status(idx, "▶ ArepoVTK Ray Marching...", progress=-1,
+                                style="color: blue; font-size: 10px; font-weight: bold;")
+        QApplication.processEvents()
+        
+        # Check if data is available
+        if self.data is None or self.scalars is None:
+            self.log("No data available for ArepoVTK renderer")
+            return False, None
+        
+        # Set data on the ArepoVTK renderer
+        self.arepovtk_renderer.set_data(self.data, self.scalars)
+        self.arepovtk_renderer.update_transfer_function(self.transfer_function)
+        
+        # Configure ArepoVTK renderer parameters from config
+        step_size = config.get('step_size', 0.01)  # As fraction of diagonal
+        idw_power = config.get('idw_power', 2.0)   # ArepoVTK default is 2.0
+        k_neighbors = config.get('k_neighbors', 32)  # KD-tree neighbors
+        interpolation_method = config.get('interpolation_method', 'idw')  # 'idw' or 'natural_neighbor'
+        nn_grid_resolution = config.get('nn_grid_resolution', 128)  # Grid res for NN
+        
+        self.arepovtk_renderer.step_size = step_size
+        self.arepovtk_renderer.idw_power = idw_power
+        self.arepovtk_renderer.interpolation_method = interpolation_method
+        self.arepovtk_renderer.nn_grid_resolution = nn_grid_resolution
+        
+        self.log(f"  Interpolation: {interpolation_method}")
+        self.log(f"  Step size: {step_size}, IDW power: {idw_power}, K neighbors: {k_neighbors}")
+        if interpolation_method == 'natural_neighbor':
+            self.log(f"  NN grid resolution: {nn_grid_resolution}")
+        self.log(f"  Canvas size: {canvas_size[0]}x{canvas_size[1]}")
+        
+        # Get bounds - use subvolume if active
+        bounds = self.subvolume.get_active_bounds()
+        if bounds:
+            bounds = (np.array(bounds[0]), np.array(bounds[1]))
+            self.log(f"  Using subvolume bounds: {bounds}")
+        
+        # Prepare camera config
+        camera_position = np.array(cam_config.get('position', [0, 0, 2]))
+        camera_focal = np.array(cam_config.get('focal_point', cam_config.get('center', [0.5, 0.5, 0.5])))
+        camera_up = np.array(cam_config.get('up', cam_config.get('up_vector', [0, 1, 0])))
+        camera_fov = cam_config.get('fov', cam_config.get('view_angle', 45.0))
+        
+        self.log(f"  Camera position: {camera_position}")
+        self.log(f"  Camera focal: {camera_focal}")
+        self.log(f"  Camera FOV: {camera_fov}")
+        
+        def progress_callback(pct):
+            dialog.update_row_status(idx, f"▶ Ray Marching {pct}%", progress=pct,
+                                    style="color: blue; font-size: 10px; font-weight: bold;")
+            QApplication.processEvents()
+        
+        try:
+            # Render to image using CPU ray marcher
+            image = self.arepovtk_renderer.render_to_image(
+                width=canvas_size[0],
+                height=canvas_size[1],
+                camera_position=camera_position,
+                camera_focal=camera_focal,
+                camera_up=camera_up,
+                fov=camera_fov,
+                bounds=bounds,
+                progress_callback=progress_callback,
+                k_neighbors=k_neighbors
+            )
+            
+            if image is None or image.size == 0:
+                self.log("ArepoVTK render returned empty image")
+                return False, None
+            
+            self.log(f"  Rendered image: {image.shape}, range=[{image.min():.4f}, {image.max():.4f}]")
+            
+            # Save directly as PNG (don't use PyVista screenshot)
+            # Note: we return the image directly and let batch caller save it
+            # Also save with alpha channel intact
+            
+            # Hide all other renderers for the "screenshot" 
+            # (ArepoVTK renders directly to image, no PyVista display)
+            if self.volume_renderer:
+                self.volume_renderer.set_active(False)
+            if self.scatter_renderer:
+                self.scatter_renderer.set_active(False)
+            if self.neural_renderer:
+                self.neural_renderer.set_active(False)
+            if self.plenoxel_renderer:
+                self.plenoxel_renderer.set_active(False)
+            QApplication.processEvents()
+            
+            # For ArepoVTK, we override the normal PNG save since we already have the image
+            # Store in a special attribute for batch saver to use
+            self._arepovtk_rendered_image = image
+            
+            # Update mode state
+            self.viz_mode = 'arepovtk'
+            
+            dialog.update_row_status(idx, "▶ Saving...", progress=95,
+                                    style="color: blue; font-size: 10px; font-weight: bold;")
+            QApplication.processEvents()
+            
+            # Return success (no grid to save - ArepoVTK works differently)
+            return True, None
+            
+        except Exception as e:
+            self.log(f"ArepoVTK render failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False, None
+
+    def _batch_render_plenoxel(self, config, idx, dialog):
+        """Render plenoxel volume for batch processing.
+        
+        Builds a plenoxel grid and converts it to a volume for rendering.
+        Does NOT show the wireframe overlay - just the volume data.
+        """
+        max_depth = config.get('max_depth', 5)
+        min_points = config.get('min_points', 500)
+        
+        self.log(f"Building plenoxel grid (max_depth={max_depth}, min_points={min_points})")
+        dialog.update_row_status(idx, "▶ Building Plenoxel...", progress=-1,
+                                style="color: blue; font-size: 10px; font-weight: bold;")
+        QApplication.processEvents()
+        
+        # Check if data is available
+        if self.data is None or self.scalars is None:
+            self.log("No data available for plenoxel grid")
+            return False, None
+        
+        # Build plenoxel grid with specified settings
+        try:
+            nodes, stats = build_plenoxel_grid(
+                self.data,
+                self.scalars,
+                min_points=min_points,
+                min_depth=1,
+                max_depth=max_depth,
+            )
+            self.plenoxel_nodes = nodes
+            self.plenoxel_stats = stats
+            self.log(f"Plenoxel grid built: {stats['node_count']} cells, depth={stats['max_depth_reached']}")
+        except Exception as e:
+            self.log(f"Failed to build plenoxel grid: {e}")
+            return False, None
+        
+        if not nodes:
+            self.log("No plenoxel nodes generated")
+            return False, None
+        
+        dialog.update_row_status(idx, "▶ Converting to volume...", progress=30,
+                                style="color: blue; font-size: 10px; font-weight: bold;")
+        QApplication.processEvents()
+        
+        # Convert plenoxel grid to volume data
+        try:
+            volume, volume_stats = plenoxel_volume_from_nodes(nodes, target_depth=max_depth)
+            if volume is None:
+                self.log("Failed to convert plenoxel to volume")
+                return False, None
+            self.log(f"Plenoxel volume: {volume.shape}, range=[{volume_stats['raw_min']:.4f}, {volume_stats['raw_max']:.4f}]")
+        except Exception as e:
+            self.log(f"Failed to convert plenoxel to volume: {e}")
+            return False, None
+        
+        dialog.update_row_status(idx, "▶ Rendering volume...", progress=60,
+                                style="color: blue; font-size: 10px; font-weight: bold;")
+        QApplication.processEvents()
+        
+        # Hide other renderers
+        if self.neural_renderer:
+            self.neural_renderer.set_active(False)
+        if self.scatter_renderer:
+            self.scatter_renderer.set_active(False)
+        # Hide plenoxel wireframe overlay
+        if self.plenoxel_renderer:
+            self.plenoxel_renderer.set_active(False)
+        QApplication.processEvents()
+        
+        # Render the plenoxel volume using volume renderer
+        self.grid_values = volume
+        grid_for_render = np.ascontiguousarray(volume)
+        self.volume_renderer.render(grid_for_render, visible=True, bounds=None)
+        self.volume_renderer.set_active(True)
+        
+        # Update mode state
+        self.viz_mode = 'volume'
+        
+        self.plotter.render()
+        QApplication.processEvents()
+        
+        return True, volume
+        
+        return True
 
 
 def main():

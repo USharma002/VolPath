@@ -1,43 +1,46 @@
 import numpy as np
-from vispy import scene
+import pyvista as pv
 
 from renderers.base import RendererBase
 
 
 class ReferenceCube(RendererBase):
-    """Wireframe cube to show the [0,1]^3 bounds"""
+    """Wireframe cube to show the [0,1]^3 bounds using PyVista"""
 
-    def __init__(self, view, extent):
-        super().__init__(view, extent)
+    def __init__(self, plotter, extent):
+        super().__init__(plotter, extent)
 
     def render(self, color=(0.9, 0.9, 0.9, 0.6), visible=True):
         self.clear()
-        corners = np.array([
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 1.0, 1.0],
-        ], dtype=np.float32)
-        edges = np.array([
-            [0, 1], [1, 3], [3, 2], [2, 0],
-            [4, 5], [5, 7], [7, 6], [6, 4],
-            [0, 4], [1, 5], [2, 6], [3, 7]
-        ], dtype=np.uint32)
-
-        self.visual = scene.visuals.Line(
-            pos=corners,
-            connect=edges,
-            color=color,
-            parent=self.view.scene if visible else None,
-            method='gl'
-        )
-        self.visual.set_gl_state('translucent', depth_test=True, blend=True)
-        self.set_active(visible)
-        return self.visual
+        
+        # Create a box mesh and extract edges for wireframe
+        box = pv.Box(bounds=[0, self.extent, 0, self.extent, 0, self.extent])
+        edges = box.extract_all_edges()
+        
+        if not visible:
+            return None
+        
+        try:
+            # Convert color tuple to RGB (PyVista doesn't support alpha in line color)
+            rgb_color = color[:3] if len(color) >= 3 else (0.9, 0.9, 0.9)
+            opacity = color[3] if len(color) >= 4 else 0.6
+            
+            self.actor = self.plotter.add_mesh(
+                edges,
+                color=rgb_color,
+                opacity=opacity,
+                line_width=1,
+                render_lines_as_tubes=False,
+                show_scalar_bar=False,
+            )
+            
+            self.set_active(visible)
+            
+        except Exception as e:
+            print(f"Reference cube error: {e}")
+            return None
+        
+        return self.actor
 
 
 __all__ = ["ReferenceCube"]

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from vispy import scene
+import pyvista as pv
 
 from renderers.base import RendererBase
 from scipy.spatial import cKDTree
@@ -570,13 +570,40 @@ else:  # pragma: no cover - numba not available
 
 
 class PlenoxelRenderer(RendererBase):
-    """Renders plenoxel leaf cells as wireframe boxes."""
+    """Renders plenoxel leaf cells as wireframe boxes using PyVista.
+    
+    Memory-optimized: builds all wireframe geometry in a single pass using
+    numpy arrays instead of creating individual pv.Box objects.
+    """
 
+    # Edge indices for a box (8 vertices, 12 edges)
     EDGE_TEMPLATE = np.array([
-        [0, 1], [1, 3], [3, 2], [2, 0],
-        [4, 5], [5, 7], [7, 6], [6, 4],
-        [0, 4], [1, 5], [2, 6], [3, 7]
+        [0, 1], [1, 3], [3, 2], [2, 0],  # bottom face
+        [4, 5], [5, 7], [7, 6], [6, 4],  # top face
+        [0, 4], [1, 5], [2, 6], [3, 7]   # vertical edges
     ], dtype=np.uint32)
+    
+    def __init__(self, plotter, extent):
+        super().__init__(plotter, extent)
+        self._mesh_cache = None  # Cache last mesh for memory tracking
+
+    def clear(self, render: bool = False):
+        """Clear renderer and release mesh cache."""
+        self._mesh_cache = None
+        super().clear(render=render)
+
+    def _build_box_vertices(self, mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
+        """Build 8 corner vertices for a box. Memory-efficient inline."""
+        return np.array([
+            [mins[0], mins[1], mins[2]],  # 0
+            [maxs[0], mins[1], mins[2]],  # 1
+            [mins[0], maxs[1], mins[2]],  # 2
+            [maxs[0], maxs[1], mins[2]],  # 3
+            [mins[0], mins[1], maxs[2]],  # 4
+            [maxs[0], mins[1], maxs[2]],  # 5
+            [mins[0], maxs[1], maxs[2]],  # 6
+            [maxs[0], maxs[1], maxs[2]],  # 7
+        ], dtype=np.float32)
 
     def render(
         self,
@@ -589,46 +616,77 @@ class PlenoxelRenderer(RendererBase):
             self.clear()
             return None
 
-        positions: List[np.ndarray] = []
-        connections: List[np.ndarray] = []
-        colors: List[np.ndarray] = []
-        offset = 0
-
+        n_nodes = len(nodes)
+        
+        # Pre-allocate arrays for all geometry at once (memory efficient)
+        # Each box has 8 vertices and 12 edges (24 line segment endpoints)
+        all_vertices = np.empty((n_nodes * 8, 3), dtype=np.float32)
+        all_lines = np.empty((n_nodes * 12, 3), dtype=np.int64)  # [2, idx1, idx2] format
+        
+        # Population-based coloring
         min_pop = stats.get('min_population') if stats else None
         max_pop = stats.get('max_population') if stats else None
-        pop_range = None
-        if min_pop is not None and max_pop is not None:
-            pop_range = max(max_pop - min_pop, 1)
-
-        for node in nodes:
+        pop_range = max(max_pop - min_pop, 1) if (min_pop is not None and max_pop is not None) else None
+        
+        # Build all geometry in a single pass
+        for i, node in enumerate(nodes):
             mins = node.mins * self.extent
             maxs = node.maxs * self.extent
-            corners = _node_corners(mins, maxs)
-            positions.append(corners)
-            connections.append(self.EDGE_TEMPLATE + offset)
-            offset += 8
-            if pop_range is not None and min_pop is not None:
-                t = float(node.population - min_pop) / float(pop_range)
-            else:
-                t = 0.5
-            color = np.array([0.2 + 0.7 * t, 0.6 * (1.0 - t) + 0.2, 1.0 - 0.5 * t, 0.85], dtype=np.float32)
-            colors.append(np.repeat(color[None, :], 8, axis=0))
+            
+            # Vertex offset for this box
+            v_offset = i * 8
+            e_offset = i * 12
+            
+            # Build vertices inline (avoid function call overhead)
+            all_vertices[v_offset:v_offset + 8] = [
+                [mins[0], mins[1], mins[2]],
+                [maxs[0], mins[1], mins[2]],
+                [mins[0], maxs[1], mins[2]],
+                [maxs[0], maxs[1], mins[2]],
+                [mins[0], mins[1], maxs[2]],
+                [maxs[0], mins[1], maxs[2]],
+                [mins[0], maxs[1], maxs[2]],
+                [maxs[0], maxs[1], maxs[2]],
+            ]
+            
+            # Build edges with offset indices
+            for j, (e0, e1) in enumerate(self.EDGE_TEMPLATE):
+                all_lines[e_offset + j] = [2, v_offset + e0, v_offset + e1]
 
-        pos = np.vstack(positions)
-        conn = np.vstack(connections)
-        col = np.vstack(colors)
+        # Create single PolyData with all lines
+        cells = all_lines.ravel()
+        mesh = pv.PolyData(all_vertices, lines=cells)
+        self._mesh_cache = mesh  # Keep reference for memory management
+        
+        # Compute average color from population
+        if pop_range is not None and min_pop is not None:
+            t_avg = np.mean([(node.population - min_pop) / pop_range for node in nodes])
+        else:
+            t_avg = 0.5
+        avg_color = (0.2 + 0.7 * t_avg, 0.6 * (1.0 - t_avg) + 0.2, 1.0 - 0.5 * t_avg)
 
         self.clear()
-        self.visual = scene.visuals.Line(
-            pos=pos,
-            connect=conn,
-            color=col,
-            method='gl',
-            parent=self.view.scene if visible else None,
-        )
-        self.visual.set_gl_state('translucent', depth_test=False, blend=True)
-        self.set_active(visible)
-        return self.visual
+        
+        if not visible:
+            return None
+
+        try:
+            self.actor = self.plotter.add_mesh(
+                mesh,
+                color=avg_color,
+                opacity=0.85,
+                line_width=1,
+                render_lines_as_tubes=False,
+                show_scalar_bar=False,
+            )
+            
+            self.set_active(visible)
+            
+        except Exception as e:
+            print(f"Plenoxel render error: {e}")
+            return None
+        
+        return self.actor
 
 
 def _assign_corner_values(
@@ -746,7 +804,19 @@ def plenoxel_volume_from_nodes(
     return volume, stats
 
 
-def _node_block(node: PlenoxelNode, cell_size: np.ndarray) -> Optional[np.ndarray]:
+def _node_block(node: PlenoxelNode, cell_size: np.ndarray, out: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+    """Build interpolated block for a plenoxel node.
+    
+    Memory-optimized: reuses output buffer if provided, uses in-place operations.
+    
+    Args:
+        node: PlenoxelNode with corner values
+        cell_size: (sx, sy, sz) voxel dimensions for this block
+        out: Optional pre-allocated output buffer of shape (sx, sy, sz)
+    
+    Returns:
+        Interpolated block array of shape (sx, sy, sz)
+    """
     corner_vals = node.corner_values
     if corner_vals is None or corner_vals.size != 8:
         corner_vals = np.full(8, node.mean_scalar, dtype=np.float32)
@@ -755,38 +825,73 @@ def _node_block(node: PlenoxelNode, cell_size: np.ndarray) -> Optional[np.ndarra
     if min(sx, sy, sz) <= 0:
         return None
 
+    # Get cached axis coordinates
     u = _get_axis_coords(sx)[:, None, None]
     v = _get_axis_coords(sy)[None, :, None]
     w = _get_axis_coords(sz)[None, None, :]
+    
+    # Pre-compute complement terms to reduce allocations
+    u1 = 1.0 - u
+    v1 = 1.0 - v
+    w1 = 1.0 - w
 
     c000, c100, c010, c110, c001, c101, c011, c111 = corner_vals
-    block = (
-        c000 * (1 - u) * (1 - v) * (1 - w) +
-        c100 * u * (1 - v) * (1 - w) +
-        c010 * (1 - u) * v * (1 - w) +
-        c110 * u * v * (1 - w) +
-        c001 * (1 - u) * (1 - v) * w +
-        c101 * u * (1 - v) * w +
-        c011 * (1 - u) * v * w +
-        c111 * u * v * w
-    )
-    return block.astype(np.float32, copy=False)
+    
+    # Allocate or reuse output buffer
+    if out is None or out.shape != (sx, sy, sz):
+        out = np.empty((sx, sy, sz), dtype=np.float32)
+    
+    # Trilinear interpolation with minimal intermediate allocations
+    # Bottom face (w=0)
+    np.multiply(u1, v1, out=out)
+    out *= w1
+    out *= c000
+    
+    # Add remaining terms
+    out += c100 * (u * v1 * w1)
+    out += c010 * (u1 * v * w1)
+    out += c110 * (u * v * w1)
+    out += c001 * (u1 * v1 * w)
+    out += c101 * (u * v1 * w)
+    out += c011 * (u1 * v * w)
+    out += c111 * (u * v * w)
+    
+    return out
 
 
 def _plenoxel_volume_python(
     nodes: Sequence[PlenoxelNode],
     resolution: int,
 ) -> Tuple[np.ndarray, float, float]:
+    """Convert plenoxel nodes to dense volume array.
+    
+    Memory-optimized: reuses block buffer across nodes when possible.
+    """
     volume = np.zeros((resolution, resolution, resolution), dtype=np.float32)
     raw_min = None
     raw_max = None
+    
+    # Track last block size to reuse buffer when dimensions match
+    last_block_size = None
+    block_buffer = None
+    
     for node in nodes:
         mins_idx = np.clip((node.mins * resolution).astype(int), 0, resolution - 1)
         maxs_idx = np.clip((node.maxs * resolution).astype(int), 1, resolution)
         cell_size = maxs_idx - mins_idx
         if np.any(cell_size <= 0):
             continue
-        block = _node_block(node, cell_size)
+        
+        # Reuse block buffer if size matches
+        cell_size_tuple = tuple(cell_size)
+        if cell_size_tuple == last_block_size and block_buffer is not None:
+            block = _node_block(node, cell_size, out=block_buffer)
+        else:
+            block = _node_block(node, cell_size, out=None)
+            if block is not None:
+                block_buffer = block
+                last_block_size = cell_size_tuple
+        
         if block is None:
             continue
         x0, y0, z0 = mins_idx
